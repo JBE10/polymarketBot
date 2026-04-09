@@ -48,11 +48,26 @@ def get_private_key(
     account: str = _DEFAULT_ACCOUNT,
 ) -> str:
     """
-    Extrae la clave privada del Llavero de macOS en tiempo de ejecución.
-    Evita el uso de archivos .env vulnerables en el disco duro.
-
-    Retorna la clave como string hexadecimal, o lanza PermissionError si falla.
+    Extrae la clave privada provista vía variable de entorno (para VPS/Docker)
+    o del Llavero de macOS en tiempo de ejecución.
+    
+    Prioridad: config (PRIVATE_KEY) → Keychain macOS → Lanza PermissionError.
     """
+    from src.core.config import get_settings
+    
+    cfg_key = get_settings().private_key
+    if cfg_key:
+        clave = cfg_key.strip()
+        bare = clave.removeprefix("0x")
+        if len(bare) != 64 or not all(c in "0123456789abcdefABCDEF" for c in bare):
+            raise ValueError(
+                "La variable PRIVATE_KEY configurada no parece una clave privada "
+                "Ethereum válida (se esperan 64 caracteres hexadecimales)."
+            )
+        log.debug("Clave privada recuperada desde configuración/variable de entorno.")
+        return clave
+
+    # Si no hay env var, intentamos Keychain (macOS default)
     comando = [
         "security",
         "find-generic-password",

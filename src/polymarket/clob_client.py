@@ -217,15 +217,63 @@ class AsyncClobClient:
             return None
 
     async def get_trades(self, token_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        """Fetch recent trades via direct async HTTP."""
+        """Fetch recent trades via CLOB, with Gamma API fallback.
+
+        The CLOB ``/trades`` endpoint requires authentication and returns 401
+        in dry-run mode (no L2 credentials).  When that happens we fall back
+        to the Gamma API's public ``/prices`` endpoint which provides recent
+        price history for the regime filter without needing authentication.
+        """
+        # --- Primary: CLOB /trades -------------------------------------------
         try:
             resp = await self._http.get(
                 "/trades", params={"asset_id": token_id, "limit": limit}
             )
             resp.raise_for_status()
-            return resp.json().get("data") or []
+            data = resp.json().get("data") or []
+            if data:
+                return data
         except Exception as exc:
-            log.warning("get_trades(%s) failed: %s", token_id, exc)
+            log.debug("CLOB /trades failed (expected in dry-run): %s", exc)
+
+        # --- Fallback: Gamma API /prices -------------------------------------
+        return await self._get_trades_gamma_fallback(token_id, limit)
+
+    async def _get_trades_gamma_fallback(
+        self, token_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Synthesize a trade-like price list from the Gamma /prices endpoint.
+
+        The Gamma API endpoint ``/prices?token_id=X&fidelity=1&interval=all``
+        returns historical price snapshots that are sufficient for the regime
+        filter's Bollinger / ADX calculations.
+        """
+        try:
+            resp = await self._gamma.get(
+                "/prices",
+                params={"token_id": token_id, "fidelity": 1, "interval": "all"},
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+            # Gamma /prices returns {"history": [{"t": epoch, "p": price}, ...]}
+            history = raw.get("history") or []
+            if not history:
+                log.debug("Gamma /prices returned empty history for %s", token_id)
+                return []
+
+            # Convert to trade-like dicts that the regime filter can consume
+            trades = [
+                {"price": str(point.get("p", 0)), "timestamp": point.get("t", 0)}
+                for point in history[-limit:]
+            ]
+            log.debug(
+                "Gamma fallback: %d price points for %s", len(trades), token_id[:12]
+            )
+            return trades
+
+        except Exception as exc:
+            log.warning("Gamma /prices fallback failed for %s: %s", token_id, exc)
             return []
 
     # ── Order placement ───────────────────────────────────────────────────────

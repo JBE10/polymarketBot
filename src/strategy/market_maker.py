@@ -16,15 +16,14 @@ current bid rises to or above the sell price.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+import time
+from dataclasses import dataclass
 
 from src.core.config import Settings
 from src.core.database import Database
 from src.polymarket.clob_client import AsyncClobClient
-from src.polymarket.models import Market, OrderRequest, Side, OrderType
+from src.polymarket.models import Market, OrderRequest, OrderType, Side
 from src.strategy.regime_filter import RegimeFilter
 
 log = logging.getLogger(__name__)
@@ -44,6 +43,7 @@ class _MarketSlot:
     buy_price: float = 0.0
     sell_price: float = 0.0
     shares: float = 0.0
+    posted_at: float = 0.0  # time.time() when BUY was posted
     state: str = "IDLE"   # IDLE | BUY_POSTED | BOUGHT | SELL_POSTED
 
 
@@ -213,11 +213,27 @@ class MarketMaker:
         slot.buy_order_id = order_id
         slot.buy_price = buy_price
         slot.shares = shares
+        slot.posted_at = time.time()
 
         return {"buys_posted": 1}
 
     async def _handle_buy_posted(self, slot: _MarketSlot) -> dict[str, int]:
-        """Check if the BUY order has been filled."""
+        """Check if the BUY order has been filled or has gone stale."""
+        # -- Stale order cancellation --
+        stale_secs = self._cfg.mm_stale_order_seconds
+        elapsed = time.time() - slot.posted_at
+        if slot.posted_at > 0 and elapsed > stale_secs:
+            log.info(
+                "[MM] BUY STALE after %ds: '%s' @ %.3f — cancelling",
+                int(elapsed), slot.market.question[:40], slot.buy_price,
+            )
+            if not self._cfg.dry_run and slot.buy_order_id:
+                await self._clob.cancel_order(slot.buy_order_id)
+            if slot.round_id:
+                await self._db.cancel_mm_round(slot.round_id)
+            self._reset_slot(slot)
+            return {}
+
         filled = False
 
         if self._cfg.dry_run:
@@ -348,6 +364,7 @@ class MarketMaker:
         slot.buy_price = 0.0
         slot.sell_price = 0.0
         slot.shares = 0.0
+        slot.posted_at = 0.0
 
     async def _cancel_slot(self, slot: _MarketSlot) -> None:
         """Cancel any outstanding orders and mark round as cancelled."""

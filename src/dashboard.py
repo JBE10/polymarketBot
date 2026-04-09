@@ -4,10 +4,11 @@ Polymarket Intelligence Bot — Streamlit Analytics Dashboard.
 Run with:
     streamlit run src/dashboard.py
 
-Connects read-only to data/bot_state.db and displays three tabs:
+Connects read-only to data/bot_state.db and displays four tabs:
   1. Capital Growth Curve (P&L)
   2. AI vs Market Spread
   3. Network / Errors Log
+  4. Market Making (MM)
 """
 from __future__ import annotations
 
@@ -90,6 +91,25 @@ def load_positions() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def load_mm_rounds() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    conn = _connect()
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM mm_rounds ORDER BY created_at DESC", conn
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    for col in ("created_at", "closed_at"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.title("📈 Polymarket Intel")
@@ -111,13 +131,15 @@ st.sidebar.markdown(
 evals  = load_evaluations()
 orders = load_orders()
 positions = load_positions()
+mm_rounds = load_mm_rounds()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Capital Growth (P&L)",
     "🔬 AI vs Market Spread",
     "🌐 Network / Errors",
+    "🏦 Market Making",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -370,8 +392,99 @@ with tab3:
                 use_container_width=True,
             )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 4 — Market Making
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab4:
+    st.header("Market Making Performance")
+
+    if mm_rounds.empty:
+        st.info("No market-making data yet.  Start the bot with the MM loop enabled.")
+    else:
+        # ── Filter today's closed rounds ──────────────────────────────────────
+        today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+        closed = mm_rounds[mm_rounds["status"] == "CLOSED"].copy()
+        today_closed = closed[
+            closed["closed_at"].dt.strftime("%Y-%m-%d") == today_str
+        ] if "closed_at" in closed.columns and not closed.empty else pd.DataFrame()
+
+        # ── KPIs ──────────────────────────────────────────────────────────────
+        today_rounds = len(today_closed)
+        today_wins = len(today_closed[today_closed["realized_pnl"] > 0]) if not today_closed.empty else 0
+        today_winrate = (today_wins / today_rounds * 100) if today_rounds > 0 else 0.0
+        today_pnl = today_closed["realized_pnl"].sum() if not today_closed.empty else 0.0
+        today_rebate = today_closed["rebate_est"].sum() if "rebate_est" in today_closed.columns and not today_closed.empty else 0.0
+
+        all_rounds = len(closed)
+        all_wins = len(closed[closed["realized_pnl"] > 0]) if not closed.empty else 0
+        all_winrate = (all_wins / all_rounds * 100) if all_rounds > 0 else 0.0
+        all_pnl = closed["realized_pnl"].sum() if not closed.empty else 0.0
+
+        st.subheader("Today")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Round-Trips", f"{today_rounds:,}")
+        c2.metric("Win Rate", f"{today_winrate:.1f}%")
+        c3.metric("P&L", f"${today_pnl:+,.4f}",
+                  delta=f"{'▲' if today_pnl >= 0 else '▼'}")
+        c4.metric("Rebates (est)", f"${today_rebate:+,.4f}")
+
+        st.subheader("All-Time")
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Total Rounds", f"{all_rounds:,}")
+        c6.metric("All-Time Win Rate", f"{all_winrate:.1f}%")
+        c7.metric("Cumulative P&L", f"${all_pnl:+,.4f}")
+
+        # ── Cumulative P&L chart ──────────────────────────────────────────────
+        if not closed.empty and "closed_at" in closed.columns:
+            pnl_series = closed.sort_values("closed_at").copy()
+            pnl_series["cumulative_pnl"] = pnl_series["realized_pnl"].cumsum()
+
+            fig_mm = px.line(
+                pnl_series,
+                x="closed_at",
+                y="cumulative_pnl",
+                title="Cumulative MM P&L Over Time",
+                labels={"closed_at": "Time", "cumulative_pnl": "Cumulative P&L ($)"},
+            )
+            fig_mm.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_mm.update_layout(height=400)
+            st.plotly_chart(fig_mm, use_container_width=True)
+
+            # Per-round P&L bar
+            fig_bar = px.bar(
+                pnl_series.tail(50),
+                x="closed_at",
+                y="realized_pnl",
+                title="Per-Round P&L (last 50 closed)",
+                labels={"realized_pnl": "P&L ($)", "closed_at": "Time"},
+                color="realized_pnl",
+                color_continuous_scale=["#e74c3c", "#95a5a6", "#2ecc71"],
+                color_continuous_midpoint=0,
+            )
+            fig_bar.update_layout(height=300, showlegend=False)
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ── Active rounds table ───────────────────────────────────────────────
+        active = mm_rounds[mm_rounds["status"].isin(["BUY_POSTED", "BOUGHT", "SELL_POSTED"])]
+
+        st.markdown("---")
+        st.subheader(f"Active Rounds ({len(active)})")
+
+        if active.empty:
+            st.success("No active rounds — all slots idle.")
+        else:
+            display_cols = ["id", "question", "status", "buy_price", "sell_price", "shares", "created_at"]
+            display_cols = [c for c in display_cols if c in active.columns]
+            st.dataframe(active[display_cols], use_container_width=True)
+
+        # ── Raw data expander ─────────────────────────────────────────────────
+        with st.expander("All MM rounds (raw data)"):
+            st.dataframe(mm_rounds.tail(200), use_container_width=True)
+
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 
 import time
+
 time.sleep(refresh_secs)
 st.rerun()

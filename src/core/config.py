@@ -96,10 +96,20 @@ class Settings(BaseSettings):
     mm_order_size_usd: float = Field(25.0, gt=0, description="Fixed USD size per market-making order")
     max_consecutive_losses: int = Field(3, gt=0, description="Circuit breaker: halt after N consecutive losses")
     min_book_depth_usd: float = Field(500.0, ge=0, description="Minimum order-book depth to trade")
+    mm_stale_order_seconds: int = Field(120, gt=0, description="Cancel unfilled BUY orders older than this many seconds")
 
     # ── Bot cadence ───────────────────────────────────────────────────────────
     cycle_interval_seconds: int = Field(300, gt=0, description="Seconds between evaluation cycles")
     dry_run: bool = Field(True, description="When True, evaluate only — no real orders are placed")
+
+    # ── Production / Environment ──────────────────────────────────────────────
+    private_key: str = Field("", description="Opcional: Private key directa (prioridad sobre Keychain, necesario en VPS/Docker)")
+    telegram_bot_token: str = Field("", description="Telegram bot token para notificaciones")
+    telegram_chat_id: str = Field("", description="Telegram chat ID para notificaciones")
+    log_file: str = Field("logs/bot.log", description="Archivo de log principal")
+    log_max_bytes: int = Field(10_485_760, ge=1_000, description="Tamaño máximo de cada archivo de log (10MB default)")
+    log_backup_count: int = Field(5, ge=1, description="Cantidad de archivos de log históricos a mantener")
+    health_port: int = Field(8080, ge=1024, le=65535, description="Puerto local para el endpoint de healthcheck")
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     data_dir: Path = Field(
