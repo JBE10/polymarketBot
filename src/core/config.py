@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     # ── LLM provider selector ────────────────────────────────────────────────
-    llm_provider: str = Field("ollama", description="'ollama' para modelo local, 'gemini' para Google API")
+    llm_provider: str = Field("ollama", description="'ollama' | 'gemini' | 'claude'")
 
     # ── Google Gemini (LLM) ───────────────────────────────────────────────────
     gemini_api_key: str = Field("", description="Google Gemini API key (gratis en aistudio.google.com)")
@@ -33,10 +33,19 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field("http://localhost:11434", description="URL base de Ollama")
     ollama_model: str = Field("gemma3:4b", description="Modelo Ollama a usar")
 
+    # ── Anthropic Claude (LLM) ────────────────────────────────────────────────
+    anthropic_api_key: str = Field("", description="Anthropic API key para Claude")
+    anthropic_model: str = Field("claude-sonnet-4-20250514", description="Modelo Claude a usar")
+
     # ── OpenAI (opcional, ya no requerido) ────────────────────────────────────
     openai_api_key: str = Field("", description="OpenAI API key (opcional, no requerido)")
     openai_model: str = Field("gpt-4o-mini", description="Modelo OpenAI (si se usa)")
     openai_embedding_model: str = Field("text-embedding-3-small", description="Embedding OpenAI (si se usa)")
+
+    # ── Web Search (Tavily) ───────────────────────────────────────────────────
+    tavily_api_key: str = Field("", description="Tavily API key para busqueda web (gratis 1000/mes)")
+    web_search_enabled: bool = Field(True, description="Activar busqueda web antes de cada evaluacion LLM")
+    web_search_max_results: int = Field(5, ge=1, le=10, description="Maximo de resultados de busqueda web")
 
     # ── Polymarket wallet ─────────────────────────────────────────────────────
     polymarket_wallet_address: str = Field(
@@ -68,8 +77,8 @@ class Settings(BaseSettings):
         description="Fraction of full Kelly to wager (0.25 = quarter-Kelly)",
     )
     max_position_usd: float = Field(100.0, gt=0, description="Hard cap on any single position in USD")
-    min_ev_threshold: float = Field(0.03, description="Minimum expected-value edge required to place an order")
-    min_confidence: str = Field("MEDIUM", description="Minimum LLM confidence to act on (LOW | MEDIUM | HIGH)")
+    min_ev_threshold: float = Field(0.05, ge=0.01, description="Minimum expected value offset to trigger BUY")
+    min_confidence: str = Field("MEDIUM", description="Minimum LLM confidence (LOW, MEDIUM, HIGH)")
     max_open_positions: int = Field(10, gt=0, description="Maximum simultaneous positions")
 
     # ── Exit / take-profit strategy ───────────────────────────────────────────
@@ -78,8 +87,8 @@ class Settings(BaseSettings):
         description="Sell when price rises this fraction above entry (0.15 = +15%)",
     )
     stop_loss_pct: float = Field(
-        0.10, ge=0.01, le=1.0,
-        description="Sell when price drops this fraction below entry (0.10 = -10%)",
+        0.15, ge=0.01, le=1.0,
+        description="Sell when price drops this fraction below entry (0.15 = -15%)",
     )
     exit_days_before_end: float = Field(
         1.0, ge=0.0,
@@ -87,16 +96,22 @@ class Settings(BaseSettings):
     )
 
     # ── Market-making (spread capture) ────────────────────────────────────────
+    mm_enabled: bool = Field(False, description="Enable market-making fast loop (default OFF — directional-only is safer)")
     spread_target: float = Field(
-        0.02, ge=0.005, le=0.10,
-        description="Profit target per round-trip in price units (0.02 = 2 cents)",
+        0.03, ge=0.005, le=0.10,
+        description="Profit target per round-trip in price units (0.03 = 3 cents)",
     )
     max_mm_markets: int = Field(5, gt=0, description="Max markets to make simultaneously")
-    mm_cycle_seconds: int = Field(10, gt=0, description="Fast-loop interval for order management")
+    mm_cycle_seconds: int = Field(5, gt=0, description="Fast-loop interval for order management")
     mm_order_size_usd: float = Field(25.0, gt=0, description="Fixed USD size per market-making order")
     max_consecutive_losses: int = Field(3, gt=0, description="Circuit breaker: halt after N consecutive losses")
     min_book_depth_usd: float = Field(500.0, ge=0, description="Minimum order-book depth to trade")
-    mm_stale_order_seconds: int = Field(120, gt=0, description="Cancel unfilled BUY orders older than this many seconds")
+    mm_stale_order_seconds: int = Field(30, gt=0, description="Cancel unfilled BUY orders older than this many seconds")
+
+    # ── Microstructure (MM defense) ────────────────────────────────────────────
+    obi_block_threshold: float = Field(-0.3, ge=-1.0, le=0.0, description="Block MM entry when OBI is below this (sell pressure)")
+    max_effective_spread: float = Field(0.10, ge=0.01, le=0.50, description="Block MM when book spread > this value")
+    toxicity_lookback: int = Field(5, ge=1, description="Number of recent fills to evaluate for toxicity")
 
     # ── Bot cadence ───────────────────────────────────────────────────────────
     cycle_interval_seconds: int = Field(300, gt=0, description="Seconds between evaluation cycles")
@@ -142,7 +157,7 @@ class Settings(BaseSettings):
     @field_validator("llm_provider")
     @classmethod
     def _validate_llm_provider(cls, v: str) -> str:
-        allowed = {"ollama", "gemini"}
+        allowed = {"ollama", "gemini", "claude"}
         v = v.lower()
         if v not in allowed:
             raise ValueError(f"llm_provider must be one of {allowed}")

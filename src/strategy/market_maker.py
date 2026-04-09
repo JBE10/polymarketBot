@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from src.core.config import Settings
 from src.core.database import Database
 from src.polymarket.clob_client import AsyncClobClient
-from src.polymarket.models import Market, OrderRequest, OrderType, Side
+from src.polymarket.models import Market, OrderBook, OrderRequest, OrderType, Side
+from src.strategy.microstructure import MicrostructureAnalyzer
 from src.strategy.regime_filter import RegimeFilter
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,10 @@ class MarketMaker:
         self._cfg = settings
         self._regime = RegimeFilter(
             max_consecutive_losses=settings.max_consecutive_losses,
+        )
+        self._micro = MicrostructureAnalyzer(
+            obi_threshold=settings.obi_block_threshold,
+            max_spread=settings.max_effective_spread,
         )
         self._slots: dict[str, _MarketSlot] = {}
         self._approved_markets: dict[str, Market] = {}
@@ -144,7 +149,7 @@ class MarketMaker:
         return result
 
     async def _handle_idle(self, slot: _MarketSlot) -> dict[str, int]:
-        """Check regime, fetch book, post a passive BUY at best_bid."""
+        """Check regime + microstructure, fetch book, post a passive BUY at best_bid."""
         market = slot.market
 
         # -- Regime filter --
@@ -169,6 +174,19 @@ class MarketMaker:
         bid_depth = book.depth_usd(Side.BUY, levels=5)
         if bid_depth < self._cfg.min_book_depth_usd:
             log.debug("MM depth too low for %s: $%.0f", market.question[:40], bid_depth)
+            return {}
+
+        # -- Microstructure defense --
+        toxicity = await self._db.get_toxicity_ratio(
+            market.condition_id, self._cfg.toxicity_lookback,
+        )
+        signal = self._micro.analyze(
+            book=book,
+            spread_target=self._cfg.spread_target,
+            toxicity_ratio=toxicity,
+        )
+        if not signal.is_safe:
+            log.info("MM micro blocked %s: %s", market.question[:40], signal.block_reason)
             return {}
 
         # -- Calculate order params --
@@ -218,7 +236,7 @@ class MarketMaker:
         return {"buys_posted": 1}
 
     async def _handle_buy_posted(self, slot: _MarketSlot) -> dict[str, int]:
-        """Check if the BUY order has been filled or has gone stale."""
+        """Check if the BUY order has been filled, gone stale, or OBI turned toxic."""
         # -- Stale order cancellation --
         stale_secs = self._cfg.mm_stale_order_seconds
         elapsed = time.time() - slot.posted_at
@@ -235,18 +253,34 @@ class MarketMaker:
             return {}
 
         filled = False
+        book: OrderBook | None = None
 
         if self._cfg.dry_run:
-            # Simulate fill: if current ask <= buy_price, consider it filled
             book = await self._clob.get_order_book(slot.token_id)
             if book and book.best_ask is not None and book.best_ask <= slot.buy_price:
                 filled = True
         else:
-            # Check if the order is still in the open orders list
             open_orders = await self._clob.get_open_orders()
             order_ids = {o.get("id") or o.get("orderID") for o in open_orders}
             if slot.buy_order_id and slot.buy_order_id not in order_ids:
                 filled = True
+
+        # -- Aggressive OBI cancel: if sell pressure appeared, pull the order --
+        if not filled and book is None:
+            book = await self._clob.get_order_book(slot.token_id)
+        if not filled and book is not None:
+            obi = self._micro.order_book_imbalance(book)
+            if obi < self._cfg.obi_block_threshold:
+                log.info(
+                    "[MM] OBI cancel: '%s' OBI=%.2f — pulling buy order",
+                    slot.market.question[:40], obi,
+                )
+                if not self._cfg.dry_run and slot.buy_order_id:
+                    await self._clob.cancel_order(slot.buy_order_id)
+                if slot.round_id:
+                    await self._db.cancel_mm_round(slot.round_id)
+                self._reset_slot(slot)
+                return {}
 
         if filled:
             log.info(
@@ -255,6 +289,15 @@ class MarketMaker:
             )
             if slot.round_id:
                 await self._db.update_mm_round_bought(slot.round_id)
+                # Track fill for toxicity analysis
+                mid = book.mid_price if book else None
+                await self._db.insert_mm_fill(
+                    round_id=slot.round_id,
+                    market_id=slot.market.condition_id,
+                    side="BUY",
+                    fill_price=slot.buy_price,
+                    mid_price_after=mid,
+                )
             slot.state = "BOUGHT"
             return await self._handle_bought(slot)
 
@@ -295,17 +338,15 @@ class MarketMaker:
         return {"sells_posted": 1}
 
     async def _handle_sell_posted(self, slot: _MarketSlot) -> dict[str, int]:
-        """Check if the SELL order has been filled; also check stop-loss."""
+        """Check if the SELL order has been filled; also check stop-loss and trailing exit."""
         filled = False
         stop_hit = False
 
         book = await self._clob.get_order_book(slot.token_id)
 
         if self._cfg.dry_run:
-            # Simulate sell fill: if current bid >= sell_price
             if book and book.best_bid is not None and book.best_bid >= slot.sell_price:
                 filled = True
-            # Simulate stop-loss: if mid_price dropped below entry - stop_loss_pct
             elif book and book.mid_price is not None:
                 sl_price = slot.buy_price * (1 - self._cfg.stop_loss_pct)
                 if book.mid_price <= sl_price:
@@ -315,6 +356,34 @@ class MarketMaker:
             order_ids = {o.get("id") or o.get("orderID") for o in open_orders}
             if slot.sell_order_id and slot.sell_order_id not in order_ids:
                 filled = True
+
+        # -- Trailing exit: if price moved well above our sell, raise the sell --
+        if not filled and not stop_hit and book and book.best_bid is not None:
+            trail_threshold = slot.sell_price + self._cfg.spread_target
+            if book.best_bid > trail_threshold:
+                new_sell = min(book.best_bid, 0.99)
+                log.info(
+                    "[MM] TRAILING UP: '%s' old_sell=%.3f new_sell=%.3f (bid=%.3f)",
+                    slot.market.question[:40], slot.sell_price, new_sell, book.best_bid,
+                )
+                if not self._cfg.dry_run and slot.sell_order_id:
+                    await self._clob.cancel_order(slot.sell_order_id)
+                    resp = await self._clob.place_order(OrderRequest(
+                        token_id=slot.token_id,
+                        price=round(new_sell, 2),
+                        size=round(slot.shares, 2),
+                        side=Side.SELL,
+                        order_type=OrderType.GTC,
+                    ))
+                    slot.sell_order_id = resp.order_id
+                else:
+                    slot.sell_order_id = f"dry-sell-trail-{slot.market.condition_id[:8]}"
+
+                slot.sell_price = new_sell
+                if slot.round_id:
+                    await self._db.update_mm_round_sell_posted(
+                        slot.round_id, new_sell, slot.sell_order_id,
+                    )
 
         if filled:
             pnl = slot.shares * (slot.sell_price - slot.buy_price)
@@ -329,6 +398,14 @@ class MarketMaker:
             if slot.round_id:
                 await self._db.close_mm_round(
                     slot.round_id, slot.sell_price, pnl, rebate,
+                )
+                mid = book.mid_price if book else None
+                await self._db.insert_mm_fill(
+                    round_id=slot.round_id,
+                    market_id=slot.market.condition_id,
+                    side="SELL",
+                    fill_price=slot.sell_price,
+                    mid_price_after=mid,
                 )
 
             self._reset_slot(slot)

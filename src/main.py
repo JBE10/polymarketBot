@@ -309,16 +309,21 @@ async def main() -> None:
 
         provider = _NoProvider()  # type: ignore[assignment]
 
-    log.info("Starting dual loops: LLM (every %ds) + MM (every %ds)",
-             cfg.cycle_interval_seconds, cfg.mm_cycle_seconds)
+    loops = [
+        _slow_loop(evaluator, maker, provider, cfg),
+        _run_health_server(cfg.health_port),
+    ]
+    if cfg.mm_enabled:
+        loops.append(_fast_loop(maker, db, cfg))
+        log.info("Starting dual loops: LLM (every %ds) + MM (every %ds)",
+                 cfg.cycle_interval_seconds, cfg.mm_cycle_seconds)
+    else:
+        log.info("Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
+                 cfg.cycle_interval_seconds)
 
     try:
-        await notifier.send_message(f"🚀 <b>Polymarket Bot Iniciado</b>\nDry Run: <code>{cfg.dry_run}</code>")
-        await asyncio.gather(
-            _slow_loop(evaluator, maker, provider, cfg),
-            _fast_loop(maker, db, cfg),
-            _run_health_server(cfg.health_port),
-        )
+        await notifier.send_message(f"Bot Iniciado | Dry Run: {cfg.dry_run} | MM: {cfg.mm_enabled}")
+        await asyncio.gather(*loops)
     finally:
         log.info("Shutting down…")
         await notifier.send_message("🛑 <b>Polymarket Bot Apagado</b>")

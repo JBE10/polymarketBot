@@ -95,10 +95,34 @@ CREATE TABLE IF NOT EXISTS mm_rounds (
     closed_at       TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_orders_market     ON orders(market_id);
-CREATE INDEX IF NOT EXISTS idx_positions_market  ON positions(market_id);
-CREATE INDEX IF NOT EXISTS idx_evaluations_mkt   ON evaluations(market_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_mm_rounds_market  ON mm_rounds(market_id, status);
+CREATE TABLE IF NOT EXISTS llm_calibration (
+    market_id       TEXT    PRIMARY KEY,
+    question        TEXT    NOT NULL,
+    predicted_prob  REAL    NOT NULL,
+    market_price    REAL    NOT NULL,
+    llm_provider    TEXT    NOT NULL DEFAULT 'unknown',
+    resolved_yes    INTEGER,
+    created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    resolved_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mm_fills (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id        INTEGER NOT NULL,
+    market_id       TEXT    NOT NULL,
+    side            TEXT    NOT NULL,
+    fill_price      REAL    NOT NULL,
+    mid_price_after REAL,
+    adverse_move    REAL,
+    filled_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_market      ON orders(market_id);
+CREATE INDEX IF NOT EXISTS idx_positions_market   ON positions(market_id);
+CREATE INDEX IF NOT EXISTS idx_evaluations_mkt    ON evaluations(market_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mm_rounds_market   ON mm_rounds(market_id, status);
+CREATE INDEX IF NOT EXISTS idx_mm_fills_market    ON mm_fills(market_id, filled_at);
+CREATE INDEX IF NOT EXISTS idx_calibration_market ON llm_calibration(market_id);
 """
 
 
@@ -492,3 +516,109 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return float(row["pnl"]) if row else 0.0
+
+    # ── LLM Calibration ───────────────────────────────────────────────────
+
+    async def upsert_calibration(
+        self,
+        market_id: str,
+        question: str,
+        predicted_prob: float,
+        market_price: float,
+        llm_provider: str = "unknown",
+    ) -> None:
+        async with self._tx() as db:
+            await db.execute(
+                """
+                INSERT INTO llm_calibration
+                    (market_id, question, predicted_prob, market_price, llm_provider)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(market_id) DO UPDATE SET
+                    predicted_prob = excluded.predicted_prob,
+                    market_price   = excluded.market_price,
+                    llm_provider   = excluded.llm_provider
+                """,
+                (market_id, question, predicted_prob, market_price, llm_provider),
+            )
+
+    async def update_calibration_resolved(
+        self, market_id: str, resolved_yes: bool
+    ) -> None:
+        async with self._tx() as db:
+            await db.execute(
+                """
+                UPDATE llm_calibration
+                SET resolved_yes = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE market_id = ?
+                """,
+                (1 if resolved_yes else 0, market_id),
+            )
+
+    async def get_calibration_stats(self) -> dict[str, Any]:
+        """Return calibration summary for resolved markets."""
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                AVG(predicted_prob) as avg_predicted,
+                AVG(resolved_yes) as avg_resolved,
+                AVG(ABS(predicted_prob - market_price)) as avg_deviation
+            FROM llm_calibration
+            WHERE resolved_yes IS NOT NULL
+            """
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else {}
+
+    # ── MM Fills (toxicity tracking) ───────────────────────────────────────
+
+    async def insert_mm_fill(
+        self,
+        round_id: int,
+        market_id: str,
+        side: str,
+        fill_price: float,
+        mid_price_after: float | None = None,
+    ) -> int:
+        adverse = None
+        if mid_price_after is not None:
+            if side.upper() == "BUY":
+                adverse = fill_price - mid_price_after
+            else:
+                adverse = mid_price_after - fill_price
+
+        async with self._tx() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO mm_fills
+                    (round_id, market_id, side, fill_price, mid_price_after, adverse_move)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (round_id, market_id, side.upper(), fill_price, mid_price_after, adverse),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    async def get_recent_mm_fills(
+        self, market_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT * FROM mm_fills
+            WHERE market_id = ?
+            ORDER BY filled_at DESC
+            LIMIT ?
+            """,
+            (market_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_toxicity_ratio(self, market_id: str, lookback: int = 5) -> float:
+        """Fraction of recent fills where price moved adversely (> 0)."""
+        fills = await self.get_recent_mm_fills(market_id, lookback)
+        if not fills:
+            return 0.0
+        toxic = sum(1 for f in fills if (f.get("adverse_move") or 0) > 0.005)
+        return toxic / len(fills)

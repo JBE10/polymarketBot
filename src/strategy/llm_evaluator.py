@@ -29,6 +29,7 @@ from src.ai.prompts import (
     build_rag_query,
 )
 from src.ai.rag_engine import RagEngine
+from src.ai.web_search import WebSearcher
 from src.core.config import Settings
 from src.core.database import Database
 from src.polymarket.clob_client import AsyncClobClient
@@ -90,15 +91,30 @@ class LLMEvaluator:
         # Markets approved for market-making (populated after each cycle)
         self._approved_markets: dict[str, Market] = {}
 
+        # ── Web search engine ──────────────────────────────────────────────────
+        self._searcher = WebSearcher(
+            api_key=settings.tavily_api_key,
+            max_results=settings.web_search_max_results,
+            enabled=settings.web_search_enabled,
+        )
+        if self._searcher.is_available:
+            log.info("Web search enabled (Tavily, max_results=%d)", settings.web_search_max_results)
+        else:
+            log.info("Web search disabled (no TAVILY_API_KEY or web_search_enabled=false)")
+
         # ── Configure LLM backend ─────────────────────────────────────────────
-        self._provider = settings.llm_provider  # "ollama" | "gemini"
+        self._provider = settings.llm_provider  # "ollama" | "gemini" | "claude"
 
         if self._provider == "gemini":
             from google import genai
             self._gemini_client = genai.Client(api_key=settings.gemini_api_key)
             self._gemini_model  = settings.gemini_model
+        elif self._provider == "claude":
+            self._anthropic_key   = settings.anthropic_api_key
+            self._anthropic_model = settings.anthropic_model
+            self._http_client     = httpx.AsyncClient(timeout=120.0)
+            log.info("Using Claude API — model: %s", self._anthropic_model)
         else:
-            # Ollama — usamos httpx async contra la API local
             self._ollama_base_url = settings.ollama_base_url.rstrip("/")
             self._ollama_model    = settings.ollama_model
             self._http_client     = httpx.AsyncClient(timeout=120.0)
@@ -211,6 +227,23 @@ class LLMEvaluator:
         yes_price = market.yes_price or 0.5
         days      = market.days_to_end
 
+        # ── Web search (real-time context) ─────────────────────────────────────
+        web_context = ""
+        if self._searcher.is_available:
+            search_query = f"{market.question} {market.description[:100]}".strip()
+            web_context = await self._searcher.search(search_query)
+            if web_context:
+                log.info("Web search: %d chars for '%s'", len(web_context), market.question[:40])
+                # Persist web results into ChromaDB for future RAG retrieval
+                try:
+                    await self._rag.add_document(
+                        text=web_context,
+                        source="web_search",
+                        title=f"Web: {market.question[:80]}",
+                    )
+                except Exception:
+                    pass
+
         # ── RAG retrieval ─────────────────────────────────────────────────────
         rag_query   = build_rag_query(market.question, market.description)
         rag_context = await self._rag.retrieve(rag_query, top_k=5)
@@ -224,10 +257,13 @@ class LLMEvaluator:
             rag_context=rag_context,
             volume_24h=market.volume_24hr,
             liquidity=market.liquidity,
+            web_context=web_context,
         )
 
         # ── LLM call (dispatch by provider) ───────────────────────────────────
-        if self._provider == "ollama":
+        if self._provider == "claude":
+            evaluation = await self._call_claude(user_msg)
+        elif self._provider == "ollama":
             evaluation = await self._call_ollama(user_msg)
         else:
             evaluation = await self._call_gemini(user_msg)
@@ -261,6 +297,15 @@ class LLMEvaluator:
             key_factors=json.dumps(evaluation.key_factors),
             action=action.value,
             skip_reason=evaluation.skip_reason,
+        )
+
+        # ── Calibration tracking ──────────────────────────────────────────────
+        await self._db.upsert_calibration(
+            market_id=market.condition_id,
+            question=market.question,
+            predicted_prob=evaluation.probability_estimate,
+            market_price=yes_price,
+            llm_provider=self._provider,
         )
 
         log.info(
@@ -391,6 +436,72 @@ class LLMEvaluator:
 
         except Exception as exc:
             log.error("Gemini call failed: %s", exc)
+            return None
+
+    # ── Claude (Anthropic API) ────────────────────────────────────────────
+
+    async def _call_claude(self, user_message: str) -> Optional[MarketEvaluation]:
+        """Call Claude via Anthropic Messages API and parse structured JSON."""
+        content = ""
+        try:
+            closing = (
+                "\n\nRespond ONLY with a valid JSON object. No prose, no markdown fences.\n"
+                "Required keys: probability_estimate (float 0-1), "
+                "confidence (LOW|MEDIUM|HIGH), reasoning (string), "
+                "key_factors (array of strings), should_skip (boolean), "
+                "skip_reason (string).\n\nJSON:"
+            )
+
+            payload = {
+                "model": self._anthropic_model,
+                "max_tokens": 2048,
+                "system": SYSTEM_PROMPT,
+                "messages": [
+                    {"role": "user", "content": user_message + closing},
+                ],
+                "temperature": 0.2,
+            }
+
+            log.info("Calling Claude (%s) …", self._anthropic_model)
+
+            response = await self._http_client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers={
+                    "x-api-key": self._anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            blocks = data.get("content", [])
+            content = "".join(
+                b.get("text", "") for b in blocks if b.get("type") == "text"
+            )
+
+            if not content.strip():
+                log.warning("Claude returned empty content — skipping market.")
+                return None
+
+            json_str = self._extract_json(content)
+            args = json.loads(json_str)
+
+            if not args or "probability_estimate" not in args:
+                log.warning("Claude JSON missing required fields: %s", content[:300])
+                return None
+
+            return self._parse_evaluation(args)
+
+        except httpx.HTTPStatusError as exc:
+            log.error("Claude HTTP error %d: %s", exc.response.status_code, exc.response.text[:200])
+            return None
+        except json.JSONDecodeError as exc:
+            log.error("Failed to parse Claude JSON: %s\nRaw: %s", exc, content[:500])
+            return None
+        except Exception as exc:
+            log.error("Claude call failed: %s", exc)
             return None
 
     # ── Shared parsing ────────────────────────────────────────────────────────
