@@ -1,0 +1,20 @@
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "network: tests that require internet access to Polymarket APIs",
+    "slow: tests that take >10 seconds (e.g. LLM calls)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line length handled by formatter

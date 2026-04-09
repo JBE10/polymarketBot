@@ -1,0 +1,31 @@
+# ── TUI Dashboard ─────────────────────────────────────────────────────────────
+textual>=0.52.0
+httpx>=0.27.0
+rich>=13.7.0
+
+# ── Async infrastructure ──────────────────────────────────────────────────────
+aiosqlite>=0.20.0
+
+# ── Configuration & validation ────────────────────────────────────────────────
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# ── Blockchain / Web3 ─────────────────────────────────────────────────────────
+web3>=6.14.0
+
+# ── Polymarket CLOB ───────────────────────────────────────────────────────────
+py-clob-client>=0.14.0
+
+# ── AI / RAG ──────────────────────────────────────────────────────────────────
+# Gemini (LLM) — tier gratuito disponible en aistudio.google.com
+google-genai>=1.0.0
+# ChromaDB con embeddings locales ONNX (sin API de pago para vectores)
+chromadb>=0.5.0
+# LlamaIndex ya no es necesario para el RAG, se mantiene por compatibilidad
+openai>=1.30.0
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+plotly>=5.22.0
+pandas>=2.1.0
