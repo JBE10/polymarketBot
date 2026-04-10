@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     # ── LLM provider selector ────────────────────────────────────────────────
-    llm_provider: str = Field("ollama", description="'ollama' | 'gemini' | 'claude'")
+    llm_provider: str = Field("ollama", description="'ollama' | 'gemini' | 'claude' | 'lmstudio'")
 
     # ── Google Gemini (LLM) ───────────────────────────────────────────────────
     gemini_api_key: str = Field("", description="Google Gemini API key (gratis en aistudio.google.com)")
@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     # ── Ollama (LLM local) ────────────────────────────────────────────────────
     ollama_base_url: str = Field("http://localhost:11434", description="URL base de Ollama")
     ollama_model: str = Field("gemma3:4b", description="Modelo Ollama a usar")
+
+    # ── LM Studio (OpenAI-compatible local server) ────────────────────────────
+    lmstudio_base_url: str = Field(
+        "http://localhost:1234/v1",
+        description="Base URL for LM Studio OpenAI-compatible server (usually http://localhost:1234/v1)",
+    )
+    lmstudio_model: str = Field(
+        "local-model",
+        description="Model name as shown in LM Studio (used in /v1/chat/completions)",
+    )
+    lmstudio_api_key: str = Field(
+        "",
+        description="Optional API key for LM Studio (often not required; use any non-empty value if needed)",
+    )
 
     # ── Anthropic Claude (LLM) ────────────────────────────────────────────────
     anthropic_api_key: str = Field("", description="Anthropic API key para Claude")
@@ -42,10 +56,15 @@ class Settings(BaseSettings):
     openai_model: str = Field("gpt-4o-mini", description="Modelo OpenAI (si se usa)")
     openai_embedding_model: str = Field("text-embedding-3-small", description="Embedding OpenAI (si se usa)")
 
-    # ── Web Search (Tavily) ───────────────────────────────────────────────────
-    tavily_api_key: str = Field("", description="Tavily API key para busqueda web (gratis 1000/mes)")
-    web_search_enabled: bool = Field(True, description="Activar busqueda web antes de cada evaluacion LLM")
-    web_search_max_results: int = Field(5, ge=1, le=10, description="Maximo de resultados de busqueda web")
+    # ── Crypto Price Context (replaces Tavily — no API key required) ─────────
+    crypto_context_enabled: bool = Field(
+        True, description="Fetch live crypto prices from public APIs (CoinGecko/Binance) for short-term context"
+    )
+    crypto_context_symbols: str = Field(
+        "BTC,ETH,SOL,MATIC",
+        description="Comma-separated symbols to fetch for market context",
+    )
+    crypto_context_timeout_s: int = Field(5, ge=1, le=30, description="Timeout in seconds for price API calls")
 
     # ── Polymarket wallet ─────────────────────────────────────────────────────
     polymarket_wallet_address: str = Field(
@@ -91,8 +110,26 @@ class Settings(BaseSettings):
         description="Sell when price drops this fraction below entry (0.15 = -15%)",
     )
     exit_days_before_end: float = Field(
-        1.0, ge=0.0,
-        description="Sell open positions this many days before market resolution (avoids binary risk)",
+        0.0, ge=0.0,
+        description="Sell open positions this many days before market resolution. 0 = hold until resolution.",
+    )
+
+    # ── Short-term Market Settings ────────────────────────────────────────────
+    enable_short_term_markets: bool = Field(
+        True, description="Allow markets resolving in less than 1 day (e.g. 5-minute/10-minute crypto pools)"
+    )
+    short_term_max_minutes: int = Field(
+        120, ge=1, le=1440,
+        description="Markets resolving within this many minutes are classified as SHORT_TERM",
+    )
+    short_term_min_liquidity_usd: float = Field(
+        500.0, ge=0.0, description="Minimum liquidity (USD) for short-term markets (lower than standard threshold)"
+    )
+    short_term_min_volume_usd: float = Field(
+        100.0, ge=0.0, description="Minimum 24h volume (USD) for short-term markets"
+    )
+    short_term_cycle_seconds: int = Field(
+        30, gt=0, description="Evaluation cycle interval for short-term markets (should be << pool duration)"
     )
 
     # ── Market-making (spread capture) ────────────────────────────────────────
@@ -157,7 +194,7 @@ class Settings(BaseSettings):
     @field_validator("llm_provider")
     @classmethod
     def _validate_llm_provider(cls, v: str) -> str:
-        allowed = {"ollama", "gemini", "claude"}
+        allowed = {"ollama", "gemini", "claude", "lmstudio"}
         v = v.lower()
         if v not in allowed:
             raise ValueError(f"llm_provider must be one of {allowed}")

@@ -1,16 +1,22 @@
 """
 LLM-powered strategy orchestrator.
 
-Cycle (called once per bot iteration):
+Two evaluation modes:
+  run_cycle()            — standard markets (2–90 days), every CYCLE_INTERVAL_SECONDS
+  run_short_term_cycle() — ultra-short crypto pools (<= SHORT_TERM_MAX_MINUTES),
+                           every SHORT_TERM_CYCLE_SECONDS
+
+Each cycle:
     1. Fetch active markets from Polymarket CLOB.
     2. Filter candidates (liquidity, time horizon, not already evaluated/open).
     3. For each candidate:
-        a. Query RAG for relevant context.
-        b. Call LLM (Ollama local o Gemini API) → structured MarketEvaluation.
-        c. Run Kelly/EV mathematics.
-        d. If EV > threshold and confidence >= min_confidence:
-             – In dry-run mode: log only.
-             – In live mode: place order, persist to DB.
+        a. Gather real-time crypto context (CryptoPriceFetcher / ShortTermMarketContext).
+        b. Query RAG for relevant context (standard markets only).
+        c. Call LLM → structured MarketEvaluation.
+        d. Run Kelly/EV mathematics.
+        e. If EV > threshold and confidence >= min_confidence:
+             – Dry-run: log only.
+             – Live: place order, persist to DB.
     4. Refresh open position prices and check for exit conditions.
 """
 from __future__ import annotations
@@ -22,14 +28,17 @@ from typing import Optional
 
 import httpx
 
+from src.ai.market_context import ShortTermMarketContext
 from src.ai.prompts import (
     EVALUATE_MARKET_SCHEMA,
+    SHORT_TERM_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_evaluation_prompt,
     build_rag_query,
+    build_short_term_evaluation_prompt,
 )
 from src.ai.rag_engine import RagEngine
-from src.ai.web_search import WebSearcher
+from src.ai.web_search import CryptoPriceFetcher
 from src.core.config import Settings
 from src.core.database import Database
 from src.polymarket.clob_client import AsyncClobClient
@@ -46,14 +55,14 @@ from src.strategy.kelly import compute_kelly
 log = logging.getLogger(__name__)
 
 
-# ── Candidate filters ──────────────────────────────────────────────────────────
+# ── Standard market filters ───────────────────────────────────────────────────
 
-_MIN_LIQUIDITY_USD  = 5_000.0    # skip illiquid markets
-_MIN_DAYS_REMAINING = 2.0        # skip markets resolving in < 2 days
-_MAX_DAYS_REMAINING = 90.0       # skip very long-horizon markets (high uncertainty)
-_MIN_VOLUME_24H_USD = 500.0      # skip low-activity markets
+_MIN_LIQUIDITY_USD  = 5_000.0   # skip illiquid markets
+_MIN_DAYS_REMAINING = 2.0       # skip markets resolving in < 2 days
+_MAX_DAYS_REMAINING = 90.0      # skip very long-horizon markets
+_MIN_VOLUME_24H_USD = 500.0     # skip low-activity markets
 
-# ── JSON schema string for Ollama prompt ───────────────────────────────────────
+# ── JSON schema instructions for non-function-calling providers ───────────────
 
 _JSON_SCHEMA_INSTRUCTIONS = """\
 You MUST respond with ONLY a valid JSON object (no markdown fences, no extra text).
@@ -91,19 +100,27 @@ class LLMEvaluator:
         # Markets approved for market-making (populated after each cycle)
         self._approved_markets: dict[str, Market] = {}
 
-        # ── Web search engine ──────────────────────────────────────────────────
-        self._searcher = WebSearcher(
-            api_key=settings.tavily_api_key,
-            max_results=settings.web_search_max_results,
-            enabled=settings.web_search_enabled,
+        # ── Crypto price context (replaces Tavily) ────────────────────────────
+        self._crypto_fetcher = CryptoPriceFetcher(
+            symbols=settings.crypto_context_symbols,
+            timeout_s=settings.crypto_context_timeout_s,
+            enabled=settings.crypto_context_enabled,
         )
-        if self._searcher.is_available:
-            log.info("Web search enabled (Tavily, max_results=%d)", settings.web_search_max_results)
+        if self._crypto_fetcher.is_available():
+            log.info(
+                "Crypto price context enabled — symbols: %s",
+                settings.crypto_context_symbols,
+            )
         else:
-            log.info("Web search disabled (no TAVILY_API_KEY or web_search_enabled=false)")
+            log.info("Crypto price context disabled.")
+
+        # ── Short-term microstructure context ─────────────────────────────────
+        self._short_term_ctx = ShortTermMarketContext(
+            timeout_s=settings.crypto_context_timeout_s,
+        )
 
         # ── Configure LLM backend ─────────────────────────────────────────────
-        self._provider = settings.llm_provider  # "ollama" | "gemini" | "claude"
+        self._provider = settings.llm_provider  # "ollama"|"gemini"|"claude"|"lmstudio"
 
         if self._provider == "gemini":
             from google import genai
@@ -114,10 +131,22 @@ class LLMEvaluator:
             self._anthropic_model = settings.anthropic_model
             self._http_client     = httpx.AsyncClient(timeout=120.0)
             log.info("Using Claude API — model: %s", self._anthropic_model)
+        elif self._provider == "lmstudio":
+            self._lmstudio_base_url = settings.lmstudio_base_url.rstrip("/")
+            self._lmstudio_model    = settings.lmstudio_model
+            self._lmstudio_api_key  = (settings.lmstudio_api_key or "").strip()
+            self._http_client       = httpx.AsyncClient(timeout=120.0)
+            log.info(
+                "Using LM Studio — model: %s @ %s",
+                self._lmstudio_model,
+                self._lmstudio_base_url,
+            )
         else:
             self._ollama_base_url = settings.ollama_base_url.rstrip("/")
             self._ollama_model    = settings.ollama_model
             self._http_client     = httpx.AsyncClient(timeout=120.0)
+            log.info("Using Ollama — model: %s @ %s",
+                     self._ollama_model, self._ollama_base_url)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -127,27 +156,23 @@ class LLMEvaluator:
 
     async def run_cycle(self, bankroll: float) -> dict[str, int]:
         """
-        Execute one full evaluation cycle.
-
+        Execute one full evaluation cycle for **standard** (day-scale) markets.
         Returns a summary dict: {evaluated, acted, skipped, errors}.
         """
         summary = {"evaluated": 0, "acted": 0, "skipped": 0, "errors": 0}
 
-        # ── 1. Fetch markets ──────────────────────────────────────────────────
         markets = await self._clob.get_markets(limit=100)
         log.info("Fetched %d markets from CLOB.", len(markets))
         markets_by_id = {m.condition_id: m for m in markets}
 
-        # ── 2. Refresh prices + check exits BEFORE evaluating new markets ─────
         await self._refresh_positions()
         exits = await self._check_exits(markets_by_id)
         if exits:
             log.info("Closed %d position(s) this cycle.", exits)
 
         candidates = await self._filter_candidates(markets)
-        log.info("%d candidates pass pre-filters.", len(candidates))
+        log.info("%d standard candidates pass pre-filters.", len(candidates))
 
-        # ── 3. Evaluate each candidate ────────────────────────────────────────
         approved_this_cycle: dict[str, Market] = {}
 
         for market in candidates:
@@ -166,89 +191,174 @@ class LLMEvaluator:
                 log.exception("Error evaluating market %s: %s", market.condition_id, exc)
                 summary["errors"] += 1
 
-        # Merge into approved set (keep previous approvals that are still valid)
         for mid in list(self._approved_markets):
             if mid not in markets_by_id:
                 del self._approved_markets[mid]
         self._approved_markets.update(approved_this_cycle)
 
         log.info(
-            "Cycle complete — evaluated=%d acted=%d skipped=%d errors=%d exits=%d",
+            "Standard cycle — evaluated=%d acted=%d skipped=%d errors=%d exits=%d",
             summary["evaluated"], summary["acted"],
             summary["skipped"], summary["errors"], exits,
         )
         return summary
 
-    # ── Pre-filtering ─────────────────────────────────────────────────────────
+    async def run_short_term_cycle(self, bankroll: float) -> dict[str, int]:
+        """
+        Execute one evaluation cycle for **ultra-short** crypto pools.
+        Uses real-time microstructure data instead of RAG.
+        Returns a summary dict: {evaluated, acted, skipped, errors}.
+        """
+        if not self._cfg.enable_short_term_markets:
+            return {"evaluated": 0, "acted": 0, "skipped": 0, "errors": 0}
+
+        summary = {"evaluated": 0, "acted": 0, "skipped": 0, "errors": 0}
+
+        markets = await self._clob.get_markets(limit=200)
+        markets_by_id = {m.condition_id: m for m in markets}
+
+        # Only check exits — don't run full position refresh every short tick
+        exits = await self._check_exits(markets_by_id)
+        if exits:
+            log.info("[ST] Closed %d position(s).", exits)
+
+        candidates = await self._filter_short_term_candidates(markets)
+        log.info("[ST] %d short-term candidates pass pre-filters.", len(candidates))
+
+        approved_this_cycle: dict[str, Market] = {}
+
+        for market in candidates:
+            try:
+                result = await self._evaluate_short_term_market(market, bankroll)
+                summary["evaluated"] += 1
+
+                if result["action"] == Action.BUY:
+                    await self._act(market, result, bankroll)
+                    summary["acted"] += 1
+                    approved_this_cycle[market.condition_id] = market
+                else:
+                    summary["skipped"] += 1
+
+            except Exception as exc:
+                log.exception("[ST] Error evaluating %s: %s", market.condition_id, exc)
+                summary["errors"] += 1
+
+        for mid in list(self._approved_markets):
+            if mid not in markets_by_id:
+                del self._approved_markets[mid]
+        self._approved_markets.update(approved_this_cycle)
+
+        log.info(
+            "[ST] Short-term cycle — evaluated=%d acted=%d skipped=%d errors=%d",
+            summary["evaluated"], summary["acted"],
+            summary["skipped"], summary["errors"],
+        )
+        return summary
+
+    # ── Pre-filtering (standard markets) ─────────────────────────────────────
 
     async def _filter_candidates(self, markets: list[Market]) -> list[Market]:
-        """Apply fast, cheap filters before the expensive LLM call."""
+        """Apply fast, cheap filters before the expensive LLM call (standard markets)."""
         open_positions = {p["market_id"] for p in await self._db.get_open_positions()}
-
         candidates = []
         for m in markets:
-            # Skip if already in a position
             if m.condition_id in open_positions:
                 continue
-
-            # Skip if recently evaluated (de-duplicate across cycles)
             if await self._db.was_recently_evaluated(m.condition_id, within_hours=4):
                 continue
-
-            # Liquidity and activity gate
             if m.liquidity < _MIN_LIQUIDITY_USD:
                 continue
             if m.volume_24hr < _MIN_VOLUME_24H_USD:
                 continue
-
-            # Time horizon gate
             days = m.days_to_end
             if days is not None:
                 if days < _MIN_DAYS_REMAINING or days > _MAX_DAYS_REMAINING:
                     continue
-
-            # Must have a YES token with a valid price
             if m.yes_price is None or not (0.03 < m.yes_price < 0.97):
                 continue
-
             candidates.append(m)
-
         return candidates
 
-    # ── LLM evaluation ────────────────────────────────────────────────────────
+    # ── Pre-filtering (short-term markets) ───────────────────────────────────
+
+    async def _filter_short_term_candidates(
+        self, markets: list[Market]
+    ) -> list[Market]:
+        """Filter for ultra-short crypto pools only."""
+        cfg = self._cfg
+        max_days = cfg.short_term_max_minutes / 60.0 / 24.0
+        # Minimum time before expiry to act (2 minutes)
+        min_days = 2.0 / 60.0 / 24.0
+
+        open_positions = {p["market_id"] for p in await self._db.get_open_positions()}
+        candidates = []
+        for m in markets:
+            if m.condition_id in open_positions:
+                continue
+            # Use a shorter de-dup window for short-term pools
+            if await self._db.was_recently_evaluated(m.condition_id, within_hours=0.1):
+                continue
+            if m.liquidity < cfg.short_term_min_liquidity_usd:
+                continue
+            if m.volume_24hr < cfg.short_term_min_volume_usd:
+                continue
+            days = m.days_to_end
+            if days is None or days > max_days or days < min_days:
+                continue
+            if m.yes_price is None or not (0.05 < m.yes_price < 0.95):
+                continue
+            # Only act on crypto-related questions
+            if not self._is_crypto_market(m):
+                continue
+            candidates.append(m)
+        return candidates
+
+    @staticmethod
+    def _is_crypto_market(market: Market) -> bool:
+        """Heuristic: returns True if the question mentions a known crypto asset."""
+        _CRYPTO_TOKENS = {
+            "btc", "bitcoin", "eth", "ethereum", "sol", "solana",
+            "bnb", "binance", "xrp", "ripple", "ada", "cardano",
+            "doge", "dogecoin", "avax", "avalanche", "matic", "polygon",
+            "link", "chainlink", "dot", "polkadot", "ltc", "litecoin",
+            "crypto", "defi", "nft", "token", "coin",
+        }
+        text = (market.question + " " + (market.description or "")).lower()
+        return any(tok in text for tok in _CRYPTO_TOKENS)
+
+    # ── Standard market LLM evaluation ───────────────────────────────────────
 
     async def _evaluate_market(
         self, market: Market, bankroll: float
     ) -> dict:
-        """
-        Full pipeline for a single market:
-        RAG retrieval → LLM call → Kelly sizing → DB log.
-        """
+        """Full pipeline for a single standard market."""
         yes_price = market.yes_price or 0.5
         days      = market.days_to_end
 
-        # ── Web search (real-time context) ─────────────────────────────────────
+        # ── Crypto price context (replaces Tavily) ─────────────────────────
         web_context = ""
-        if self._searcher.is_available:
+        if self._crypto_fetcher.is_available:
             search_query = f"{market.question} {market.description[:100]}".strip()
-            web_context = await self._searcher.search(search_query)
+            web_context = await self._crypto_fetcher.search(search_query)
             if web_context:
-                log.info("Web search: %d chars for '%s'", len(web_context), market.question[:40])
-                # Persist web results into ChromaDB for future RAG retrieval
+                log.info(
+                    "Crypto context: %d chars for '%s'",
+                    len(web_context), market.question[:40],
+                )
                 try:
                     await self._rag.add_document(
                         text=web_context,
-                        source="web_search",
-                        title=f"Web: {market.question[:80]}",
+                        source="crypto_price",
+                        title=f"Crypto: {market.question[:80]}",
                     )
                 except Exception:
                     pass
 
-        # ── RAG retrieval ─────────────────────────────────────────────────────
+        # ── RAG retrieval ──────────────────────────────────────────────────
         rag_query   = build_rag_query(market.question, market.description)
         rag_context = await self._rag.retrieve(rag_query, top_k=5)
 
-        # ── Build prompt ──────────────────────────────────────────────────────
+        # ── Build prompt ───────────────────────────────────────────────────
         user_msg = build_evaluation_prompt(
             question=market.question,
             description=market.description,
@@ -260,18 +370,68 @@ class LLMEvaluator:
             web_context=web_context,
         )
 
-        # ── LLM call (dispatch by provider) ───────────────────────────────────
-        if self._provider == "claude":
-            evaluation = await self._call_claude(user_msg)
-        elif self._provider == "ollama":
-            evaluation = await self._call_ollama(user_msg)
+        return await self._run_llm_and_act(market, user_msg, yes_price, bankroll,
+                                           system_prompt=SYSTEM_PROMPT)
+
+    # ── Short-term market LLM evaluation ─────────────────────────────────────
+
+    async def _evaluate_short_term_market(
+        self, market: Market, bankroll: float
+    ) -> dict:
+        """Full pipeline for an ultra-short crypto market."""
+        yes_price = market.yes_price or 0.5
+        days      = market.days_to_end
+        minutes   = days * 24.0 * 60.0 if days is not None else None
+
+        # ── Real-time microstructure context ───────────────────────────────
+        crypto_context = await self._short_term_ctx.get_context(market.question)
+        if crypto_context:
+            log.info(
+                "[ST] Microstructure context (%d chars) for '%s'",
+                len(crypto_context), market.question[:40],
+            )
         else:
-            evaluation = await self._call_gemini(user_msg)
+            log.info("[ST] No microstructure data for '%s'", market.question[:40])
+
+        # ── Build short-term prompt ─────────────────────────────────────────
+        user_msg = build_short_term_evaluation_prompt(
+            question=market.question,
+            description=market.description,
+            current_yes_price=yes_price,
+            minutes_to_end=minutes,
+            crypto_context=crypto_context,
+            volume_24h=market.volume_24hr,
+            liquidity=market.liquidity,
+        )
+
+        return await self._run_llm_and_act(market, user_msg, yes_price, bankroll,
+                                           system_prompt=SHORT_TERM_SYSTEM_PROMPT)
+
+    # ── Shared LLM dispatch + decision + DB persist ───────────────────────────
+
+    async def _run_llm_and_act(
+        self,
+        market: Market,
+        user_msg: str,
+        yes_price: float,
+        bankroll: float,
+        system_prompt: str,
+    ) -> dict:
+        """Dispatch LLM call, compute Kelly, log to DB, return decision dict."""
+        # ── LLM call (dispatch by provider) ───────────────────────────────
+        if self._provider == "claude":
+            evaluation = await self._call_claude(user_msg, system_prompt)
+        elif self._provider == "lmstudio":
+            evaluation = await self._call_lmstudio(user_msg, system_prompt)
+        elif self._provider == "ollama":
+            evaluation = await self._call_ollama(user_msg, system_prompt)
+        else:
+            evaluation = await self._call_gemini(user_msg, system_prompt)
 
         if evaluation is None:
             return {"action": Action.SKIP, "skip_reason": "LLM call failed"}
 
-        # ── Kelly / EV sizing ─────────────────────────────────────────────────
+        # ── Kelly / EV sizing ──────────────────────────────────────────────
         kelly = compute_kelly(
             prob=evaluation.probability_estimate,
             entry_price=yes_price,
@@ -280,10 +440,9 @@ class LLMEvaluator:
             max_position_usd=self._cfg.max_position_usd,
         )
 
-        # ── Decision ─────────────────────────────────────────────────────────
         action = self._decide(evaluation, kelly)
 
-        # ── Persist evaluation ─────────────────────────────────────────────────
+        # ── Persist evaluation ─────────────────────────────────────────────
         await self._db.insert_evaluation(
             market_id=market.condition_id,
             question=market.question,
@@ -299,7 +458,6 @@ class LLMEvaluator:
             skip_reason=evaluation.skip_reason,
         )
 
-        # ── Calibration tracking ──────────────────────────────────────────────
         await self._db.upsert_calibration(
             market_id=market.condition_id,
             question=market.question,
@@ -327,12 +485,12 @@ class LLMEvaluator:
 
     # ── Ollama (local) ────────────────────────────────────────────────────────
 
-    async def _call_ollama(self, user_message: str) -> Optional[MarketEvaluation]:
+    async def _call_ollama(
+        self, user_message: str, system_prompt: str = SYSTEM_PROMPT
+    ) -> Optional[MarketEvaluation]:
         """Call Ollama local API and parse structured JSON response."""
         content = ""
         try:
-            # Append explicit JSON instructions to the user message — more reliable
-            # than `format: "json"` for small models like gemma3:4b which return {}
             closing = (
                 "\n\nRespond ONLY with a JSON object. No prose, no markdown fences. "
                 "Required keys: probability_estimate (float 0-1), "
@@ -344,13 +502,10 @@ class LLMEvaluator:
             payload = {
                 "model": self._ollama_model,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_message + closing},
                 ],
                 "stream": False,
-                # Note: "format": "json" is intentionally omitted — gemma3:4b
-                # returns empty JSON {} when it is set, but works correctly
-                # when the instruction appears in the user message instead.
                 "options": {
                     "temperature": 0.1,
                     "num_predict": 1024,
@@ -363,7 +518,7 @@ class LLMEvaluator:
             response = await self._http_client.post(url, json=payload)
             response.raise_for_status()
 
-            data = response.json()
+            data    = response.json()
             content = data.get("message", {}).get("content", "")
 
             if not content.strip():
@@ -371,7 +526,7 @@ class LLMEvaluator:
                 return None
 
             json_str = self._extract_json(content)
-            args = json.loads(json_str)
+            args     = json.loads(json_str)
 
             if not args or "probability_estimate" not in args:
                 log.warning("Ollama JSON missing required fields: %s", content[:300])
@@ -391,7 +546,9 @@ class LLMEvaluator:
 
     # ── Gemini (Google API) ───────────────────────────────────────────────────
 
-    async def _call_gemini(self, user_message: str) -> Optional[MarketEvaluation]:
+    async def _call_gemini(
+        self, user_message: str, system_prompt: str = SYSTEM_PROMPT
+    ) -> Optional[MarketEvaluation]:
         """Call Gemini with function-calling and parse the structured response."""
         try:
             from google.genai import types as genai_types
@@ -400,7 +557,7 @@ class LLMEvaluator:
                 function_declarations=[EVALUATE_MARKET_SCHEMA]
             )
             config = genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=system_prompt,
                 tools=[tool],
                 tool_config=genai_types.ToolConfig(
                     function_calling_config=genai_types.FunctionCallingConfig(
@@ -417,7 +574,6 @@ class LLMEvaluator:
                 config=config,
             )
 
-            # Extract function call from response
             args = None
             for candidate in response.candidates:
                 for part in candidate.content.parts:
@@ -429,7 +585,7 @@ class LLMEvaluator:
                     break
 
             if args is None:
-                log.warning("Gemini no devolvió un function call.")
+                log.warning("Gemini returned no function call.")
                 return None
 
             return self._parse_evaluation(args)
@@ -438,9 +594,84 @@ class LLMEvaluator:
             log.error("Gemini call failed: %s", exc)
             return None
 
-    # ── Claude (Anthropic API) ────────────────────────────────────────────
+    # ── LM Studio (OpenAI-compatible) ─────────────────────────────────────────
 
-    async def _call_claude(self, user_message: str) -> Optional[MarketEvaluation]:
+    async def _call_lmstudio(
+        self, user_message: str, system_prompt: str = SYSTEM_PROMPT
+    ) -> Optional[MarketEvaluation]:
+        """Call LM Studio OpenAI-compatible API and parse structured JSON response."""
+        content = ""
+        try:
+            closing = (
+                "\n\nRespond ONLY with a valid JSON object. No prose, no markdown fences. "
+                "Required keys: probability_estimate (float 0-1), "
+                "confidence (LOW|MEDIUM|HIGH), reasoning (string), "
+                "key_factors (array of strings), should_skip (boolean), "
+                "skip_reason (string).\n\nJSON:"
+            )
+
+            payload = {
+                "model": self._lmstudio_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message + closing},
+                ],
+                "temperature": 0.2,
+            }
+
+            headers = {"content-type": "application/json"}
+            if self._lmstudio_api_key:
+                headers["authorization"] = f"Bearer {self._lmstudio_api_key}"
+
+            url = f"{self._lmstudio_base_url}/chat/completions"
+            log.info("Calling LM Studio (%s) …", self._lmstudio_model)
+
+            response = await self._http_client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+            choices = data.get("choices", [])
+            if not choices:
+                log.warning("LM Studio returned no choices.")
+                return None
+
+            content = (
+                choices[0].get("message", {}).get("content")
+                or choices[0].get("text")
+                or ""
+            )
+            if not content.strip():
+                log.warning("LM Studio returned empty content.")
+                return None
+
+            json_str = self._extract_json(content)
+            args     = json.loads(json_str)
+
+            if not args or "probability_estimate" not in args:
+                log.warning("LM Studio JSON missing required fields: %s", content[:300])
+                return None
+
+            return self._parse_evaluation(args)
+
+        except httpx.HTTPStatusError as exc:
+            log.error(
+                "LM Studio HTTP error %d: %s",
+                exc.response.status_code,
+                exc.response.text[:200],
+            )
+            return None
+        except json.JSONDecodeError as exc:
+            log.error("Failed to parse LM Studio JSON: %s\nRaw: %s", exc, content[:500])
+            return None
+        except Exception as exc:
+            log.error("LM Studio call failed: %s", exc)
+            return None
+
+    # ── Claude (Anthropic API) ─────────────────────────────────────────────────
+
+    async def _call_claude(
+        self, user_message: str, system_prompt: str = SYSTEM_PROMPT
+    ) -> Optional[MarketEvaluation]:
         """Call Claude via Anthropic Messages API and parse structured JSON."""
         content = ""
         try:
@@ -453,9 +684,9 @@ class LLMEvaluator:
             )
 
             payload = {
-                "model": self._anthropic_model,
+                "model":      self._anthropic_model,
                 "max_tokens": 2048,
-                "system": SYSTEM_PROMPT,
+                "system":     system_prompt,
                 "messages": [
                     {"role": "user", "content": user_message + closing},
                 ],
@@ -468,15 +699,15 @@ class LLMEvaluator:
                 "https://api.anthropic.com/v1/messages",
                 json=payload,
                 headers={
-                    "x-api-key": self._anthropic_key,
+                    "x-api-key":         self._anthropic_key,
                     "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
+                    "content-type":      "application/json",
                 },
             )
             response.raise_for_status()
 
-            data = response.json()
-            blocks = data.get("content", [])
+            data    = response.json()
+            blocks  = data.get("content", [])
             content = "".join(
                 b.get("text", "") for b in blocks if b.get("type") == "text"
             )
@@ -486,7 +717,7 @@ class LLMEvaluator:
                 return None
 
             json_str = self._extract_json(content)
-            args = json.loads(json_str)
+            args     = json.loads(json_str)
 
             if not args or "probability_estimate" not in args:
                 log.warning("Claude JSON missing required fields: %s", content[:300])
@@ -509,8 +740,7 @@ class LLMEvaluator:
     @staticmethod
     def _extract_json(text: str) -> str:
         """Strip markdown code fences if present and return raw JSON string."""
-        text = text.strip()
-        # Remove ```json ... ``` wrappers
+        text  = text.strip()
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
         if match:
             return match.group(1).strip()
@@ -538,25 +768,24 @@ class LLMEvaluator:
             ev.confidence.value, ev.should_skip, self._cfg.min_confidence,
         )
 
-        # Hard math gates first — if the numbers don't work, always skip
         if not kelly.is_positive_ev:
             return Action.SKIP
 
         if kelly.ev_per_dollar < self._cfg.min_ev_threshold:
             return Action.SKIP
 
-        if kelly.position_usd < 1.0:   # never bother for < $1
+        if kelly.position_usd < 1.0:
             log.info("SKIP: position too small ($%.2f)", kelly.position_usd)
             return Action.SKIP
 
-        # Confidence gate
         meets = self._cfg.meets_confidence(ev.confidence.value)
-        log.info("Confidence check: level=%s min=%s meets=%s", ev.confidence.value, self._cfg.min_confidence, meets)
+        log.info(
+            "Confidence check: level=%s min=%s meets=%s",
+            ev.confidence.value, self._cfg.min_confidence, meets,
+        )
         if not meets:
             return Action.SKIP
 
-        # LLM's qualitative skip recommendation only applies when EV is marginal
-        # (< 2× the minimum threshold). Strong EV overrides a soft skip signal.
         if ev.should_skip and kelly.ev_per_dollar < self._cfg.min_ev_threshold * 2:
             return Action.SKIP
 
@@ -566,7 +795,7 @@ class LLMEvaluator:
 
     async def _act(self, market: Market, result: dict, bankroll: float) -> None:
         """Place an order (or simulate in dry-run) and update the database."""
-        kelly    = result["kelly"]
+        kelly     = result["kelly"]
         yes_price = result["yes_price"]
         yes_token = market.yes_token
 
@@ -591,7 +820,6 @@ class LLMEvaluator:
                 size=shares,
                 status="DRY_RUN",
             )
-            # Record position so exit logic can track it next cycle
             await self._db.upsert_position(
                 market_id=market.condition_id,
                 token_id=yes_token.token_id,
@@ -604,10 +832,9 @@ class LLMEvaluator:
             )
             return
 
-        # ── Live order ─────────────────────────────────────────────────────────
         order_req = OrderRequest(
             token_id=yes_token.token_id,
-            price=round(yes_price, 2),   # round to tick
+            price=round(yes_price, 2),
             size=round(shares, 2),
             side=Side.BUY,
         )
@@ -687,48 +914,43 @@ class LLMEvaluator:
         if not positions:
             return 0
 
-        tp  = self._cfg.take_profit_pct
-        sl  = self._cfg.stop_loss_pct
-        tde = self._cfg.exit_days_before_end
+        tp    = self._cfg.take_profit_pct
+        sl    = self._cfg.stop_loss_pct
+        tde   = self._cfg.exit_days_before_end
         closed = 0
 
         for pos in positions:
-            market_id    = pos["market_id"]
-            entry        = pos["avg_entry_price"]
-            current      = pos.get("current_price") or entry
-            shares       = pos["shares"]
-            cost_usd     = pos["cost_usd"]
-            question     = pos["question"][:55]
+            market_id = pos["market_id"]
+            entry     = pos["avg_entry_price"]
+            current   = pos.get("current_price") or entry
+            shares    = pos["shares"]
+            cost_usd  = pos["cost_usd"]
+            question  = pos["question"][:55]
 
-            # ── 1. Take-profit ────────────────────────────────────────────────
             if current >= entry * (1 + tp):
-                reason    = f"take-profit +{tp*100:.0f}%"
-                pnl       = shares * current - cost_usd
-                pnl_pct   = pnl / cost_usd * 100 if cost_usd else 0
+                reason  = f"take-profit +{tp*100:.0f}%"
+                pnl     = shares * current - cost_usd
+                pnl_pct = pnl / cost_usd * 100 if cost_usd else 0
                 await self._sell_position(pos, current, reason)
                 log.info(
-                    "✅ EXIT [%s] '%s'\n"
-                    "   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
+                    "✅ EXIT [%s] '%s'\n   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
                     reason, question, entry, current, pnl, pnl_pct,
                 )
                 closed += 1
                 continue
 
-            # ── 2. Stop-loss ──────────────────────────────────────────────────
             if current <= entry * (1 - sl):
-                reason    = f"stop-loss -{sl*100:.0f}%"
-                pnl       = shares * current - cost_usd
-                pnl_pct   = pnl / cost_usd * 100 if cost_usd else 0
+                reason  = f"stop-loss -{sl*100:.0f}%"
+                pnl     = shares * current - cost_usd
+                pnl_pct = pnl / cost_usd * 100 if cost_usd else 0
                 await self._sell_position(pos, current, reason)
                 log.info(
-                    "🛑 EXIT [%s] '%s'\n"
-                    "   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
+                    "🛑 EXIT [%s] '%s'\n   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
                     reason, question, entry, current, pnl, pnl_pct,
                 )
                 closed += 1
                 continue
 
-            # ── 3. Time-based exit ────────────────────────────────────────────
             market = markets_by_id.get(market_id)
             if market and market.days_to_end is not None:
                 if market.days_to_end <= tde:
@@ -737,8 +959,7 @@ class LLMEvaluator:
                     pnl_pct = pnl / cost_usd * 100 if cost_usd else 0
                     await self._sell_position(pos, current, reason)
                     log.info(
-                        "⏰ EXIT [%s] '%s'\n"
-                        "   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
+                        "⏰ EXIT [%s] '%s'\n   entry=%.3f  exit=%.3f  pnl=%+.2f (%+.1f%%)",
                         reason, question, entry, current, pnl, pnl_pct,
                     )
                     closed += 1
@@ -753,9 +974,9 @@ class LLMEvaluator:
         question  = pos["question"]
 
         if self._cfg.dry_run:
-            proceeds  = shares * exit_price
-            cost_usd  = pos["cost_usd"]
-            pnl       = proceeds - cost_usd
+            proceeds = shares * exit_price
+            cost_usd = pos["cost_usd"]
+            pnl      = proceeds - cost_usd
             log.info(
                 "[DRY-RUN] Would SELL %.2f shares of '%s' at %.3f "
                 "→ proceeds=$%.2f  pnl=%+.2f  reason=%s",

@@ -1,0 +1,28 @@
+---
+description: Use local Antigravity Awesome Skills library in this repo
+alwaysApply: true
+---
+
+# Antigravity Awesome Skills (local library)
+
+This repo includes a local copy of **Antigravity Awesome Skills** at:
+
+- `.agents/skills/`
+- Skills live under `.agents/skills/skills/<skill-name>/SKILL.md`
+- Catalog / index:
+  - `.agents/skills/CATALOG.md`
+  - `.agents/skills/skills_index.json`
+  - Cursor-specific usage docs: `.agents/skills/docs/users/cursor-skills.md`
+
+## How to use skills during this project
+
+- When the user asks for a workflow (“plan”, “debug”, “refactor”, “testing”, “security”, “deploy”, etc.), prefer applying one of these skills.
+- Pick a skill by:
+  - Searching the catalog first (`CATALOG.md`) for a matching name/topic
+  - Then reading the corresponding `SKILL.md` and following its steps
+
+## Conventions
+
+- Treat skills as **operating instructions** (constraints + steps), not as text to paste verbatim.
+- If a skill conflicts with project constraints (dry-run safety, no pushing, no secrets), project constraints win.
+
