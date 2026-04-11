@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from functools import partial
 from typing import Any, Optional
 
@@ -98,6 +99,8 @@ class AsyncClobClient:
             headers={"User-Agent": "polymarket-bot/1.0", "Accept": "application/json"},
             timeout=30.0,
         )
+        self._idempotent_results: dict[str, OrderResponse] = {}
+        self._idempotent_locks: dict[str, asyncio.Lock] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -278,50 +281,149 @@ class AsyncClobClient:
 
     # ── Order placement ───────────────────────────────────────────────────────
 
-    async def place_order(self, request: OrderRequest) -> OrderResponse:
+    async def place_order(
+        self,
+        request: OrderRequest,
+        *,
+        idempotency_key: Optional[str] = None,
+        max_retries: int = 3,
+        base_backoff_seconds: float = 0.25,
+    ) -> OrderResponse:
         """
         Sign and submit a limit order to the CLOB.
         Returns OrderResponse — caller should inspect `.success`.
         """
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if base_backoff_seconds < 0:
+            raise ValueError("base_backoff_seconds must be >= 0")
+
+        if idempotency_key:
+            lock = self._idempotent_locks.setdefault(idempotency_key, asyncio.Lock())
+            async with lock:
+                cached = self._idempotent_results.get(idempotency_key)
+                if cached is not None:
+                    return cached.model_copy(deep=True)
+
+                result = await self._place_order_with_retry(
+                    request,
+                    max_retries=max_retries,
+                    base_backoff_seconds=base_backoff_seconds,
+                )
+                if result.order_id is not None or result.success:
+                    self._idempotent_results[idempotency_key] = result.model_copy(deep=True)
+                return result
+
+        return await self._place_order_with_retry(
+            request,
+            max_retries=max_retries,
+            base_backoff_seconds=base_backoff_seconds,
+        )
+
+    async def _place_order_with_retry(
+        self,
+        request: OrderRequest,
+        *,
+        max_retries: int,
+        base_backoff_seconds: float,
+    ) -> OrderResponse:
         assert self._client
-        try:
-            order_args = OrderArgs(
-                token_id=request.token_id,
-                price=request.price,
-                size=request.size,
-                side=request.side.value,
-            )
-            order_type = (
-                OrderType.FOK if request.order_type.value == "FOK"
-                else OrderType.GTC
-            )
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                order_args = OrderArgs(
+                    token_id=request.token_id,
+                    price=request.price,
+                    size=request.size,
+                    side=request.side.value,
+                )
+                order_type = (
+                    OrderType.FOK if request.order_type.value == "FOK"
+                    else OrderType.GTC
+                )
 
-            # Sign (CPU-bound but fast)
-            signed = await asyncio.to_thread(
-                partial(self._client.create_order, order_args=order_args)
-            )
-            # Submit
-            resp = await asyncio.to_thread(
-                partial(self._client.post_order, order=signed, order_type=order_type)
-            )
+                signed = await asyncio.to_thread(
+                    partial(self._client.create_order, order_args=order_args)
+                )
+                resp = await asyncio.to_thread(
+                    partial(self._client.post_order, order=signed, order_type=order_type)
+                )
 
-            oid = resp.get("orderID") or resp.get("id")
-            txh = resp.get("transactionHash")
-            status_str = resp.get("status", "PENDING").upper()
+                order_resp = self._parse_order_response(resp)
 
-            return OrderResponse(
-                order_id=oid,
-                status=OrderStatus(status_str) if status_str in OrderStatus.__members__ else OrderStatus.PENDING,
-                transaction_hash=txh,
-                filled_size=float(resp.get("sizeMatched", 0) or 0),
-            )
+                if order_resp.order_id is None:
+                    err_msg = order_resp.error_message or "missing order id"
+                    if self._is_transient_error(err_msg) and attempt < max_retries:
+                        await self._sleep_backoff(attempt, base_backoff_seconds)
+                        attempt += 1
+                        continue
 
-        except Exception as exc:
-            log.error("place_order failed: %s", exc)
-            return OrderResponse(
-                status=OrderStatus.REJECTED,
-                error_message=str(exc),
-            )
+                return order_resp
+
+            except Exception as exc:
+                transient = self._is_transient_error(exc)
+                if transient and attempt < max_retries:
+                    log.warning(
+                        "place_order transient failure (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries + 1,
+                        exc,
+                    )
+                    await self._sleep_backoff(attempt, base_backoff_seconds)
+                    attempt += 1
+                    continue
+
+                log.error("place_order failed: %s", exc)
+                return OrderResponse(
+                    status=OrderStatus.REJECTED,
+                    error_message=str(exc),
+                )
+
+        return OrderResponse(
+            status=OrderStatus.REJECTED,
+            error_message="max retries exceeded",
+        )
+
+    def _parse_order_response(self, resp: dict[str, Any]) -> OrderResponse:
+        oid = resp.get("orderID") or resp.get("id")
+        txh = resp.get("transactionHash")
+        raw_status = str(resp.get("status", "PENDING")).upper()
+        status = OrderStatus.__members__.get(raw_status, OrderStatus.PENDING)
+        error_message = resp.get("error") or resp.get("errorMsg") or resp.get("message")
+
+        return OrderResponse(
+            order_id=oid,
+            status=status,
+            transaction_hash=txh,
+            error_message=error_message,
+            filled_size=float(resp.get("sizeMatched", 0) or 0),
+        )
+
+    @staticmethod
+    def _is_transient_error(error: Exception | str) -> bool:
+        text = str(error).lower()
+        transient_markers = (
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "network",
+            "service unavailable",
+            "too many requests",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+        return any(marker in text for marker in transient_markers)
+
+    async def _sleep_backoff(self, attempt: int, base_backoff_seconds: float) -> None:
+        jitter = random.uniform(0.8, 1.2)
+        delay = base_backoff_seconds * (2 ** attempt) * jitter
+        await asyncio.sleep(delay)
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order."""

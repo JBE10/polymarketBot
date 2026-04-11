@@ -1,0 +1,171 @@
+environment: "demo"   # demo | real
+
+general:
+  timezone: "UTC"
+  candle_timeframes: ["1m", "5m"]
+  decision_interval_seconds: 30
+  pool_timeframe_minutes: 15
+  no_trade_last_minutes_before_expiry: 3
+
+universe:
+  enabled_assets: ["BTC", "ETH", "SOL", "BNB", "XRP"]
+  max_assets_per_round: 2
+  min_minutes_between_trades_same_asset: 15
+
+data_sources:
+  polymarket:
+    use_api: true
+    clob_base_url: "https://clob.polymarket.com"   # ajusta al endpoint que uses
+    timeout_seconds: 8
+    retries: 3
+    retry_backoff_seconds: 1.2
+  market_data:
+    provider: "binance"
+    timeout_seconds: 6
+    retries: 3
+
+features:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  atr_period: 14
+  momentum_lookback_bars_5m: 3
+  volatility_lookback_bars_5m: 24
+
+model:
+  # score = w1*ema_signal + w2*rsi_signal + w3*momentum + w4*vol_regime
+  weights:
+    ema_signal: 0.35
+    rsi_signal: 0.20
+    momentum: 0.30
+    vol_regime: 0.15
+  logistic_temperature: 1.0
+  calibration:
+    enabled: false   # luego lo activas cuando calibres con histórico
+
+market_filters:
+  min_orderbook_depth_usd:
+    BTC: 3000
+    ETH: 2500
+    SOL: 1800
+    BNB: 1800
+    XRP: 1500
+  max_spread_pct:
+    BTC: 1.0
+    ETH: 1.2
+    SOL: 1.6
+    BNB: 1.6
+    XRP: 1.8
+  max_estimated_slippage_pct:
+    BTC: 0.7
+    ETH: 0.8
+    SOL: 1.2
+    BNB: 1.2
+    XRP: 1.5
+
+cost_model:
+  taker_fee_pct: 0.20      # ejemplo, ajusta a tu caso real
+  maker_fee_pct: 0.00      # si aplica
+  use_taker_by_default: true
+  extra_buffer_pct: 0.15   # colchón por latencia/ejecución
+
+entry_rules:
+  # edge_net = (p_model - p_market) - total_cost
+  edge_threshold_pct:
+    BTC: 3.2
+    ETH: 3.5
+    SOL: 4.8
+    BNB: 4.8
+    XRP: 5.5
+  require_trend_alignment: true
+  trend_rules:
+    long: "ema_fast > ema_slow and rsi > 52"
+    short: "ema_fast < ema_slow and rsi < 48"
+  block_if_high_noise: true
+  high_noise_rules:
+    min_atr_percentile: 35
+
+ranking:
+  enabled: true
+  score_formula: "edge_net * liquidity_score * trend_quality * (1 - spread_penalty)"
+  min_score_to_trade: 0.15
+
+risk:
+  bankroll_usd: 1000
+  risk_per_trade_pct: 0.50
+  max_total_exposure_pct: 2.5
+  max_exposure_per_asset_pct: 1.0
+  max_daily_drawdown_pct: 3.0
+  consecutive_losses_cooldown:
+    enabled: true
+    losses: 2
+    cooldown_pools: 1
+
+position_sizing:
+  method: "vol_adjusted_edge_scaled"
+  target_volatility_reference: 1.0
+  min_notional_usd: 15
+  max_notional_usd_per_trade: 80
+  edge_scale_cap: 2.0
+
+execution:
+  order_type_preference: "limit"
+  limit_offset_ticks: 1
+  time_in_force_seconds: 20
+  cancel_if_not_filled: true
+  max_requotes: 2
+  idempotency_enabled: true
+
+safety:
+  kill_switch:
+    on_api_error_streak: 6
+    on_rejected_orders_streak: 4
+    on_daily_dd_breach: true
+  trading_hours_utc:
+    enabled: false
+    start: "00:00"
+    end: "23:59"
+
+logging:
+  level: "INFO"
+  structured_json: true
+  save_decisions: true
+  save_orderbook_snapshots: false
+  metrics_output: "data/metrics.csv"
+  trades_output: "data/trades.csv"
+
+profiles:
+  demo:
+    risk:
+      bankroll_usd: 1000
+      risk_per_trade_pct: 0.50
+      max_total_exposure_pct: 2.5
+      max_daily_drawdown_pct: 3.0
+    entry_rules:
+      edge_threshold_pct:
+        BTC: 3.2
+        ETH: 3.5
+        SOL: 4.8
+        BNB: 4.8
+        XRP: 5.5
+
+  real:
+    risk:
+      bankroll_usd: 1000
+      risk_per_trade_pct: 0.30
+      max_total_exposure_pct: 1.8
+      max_daily_drawdown_pct: 2.2
+    market_filters:
+      max_spread_pct:
+        BTC: 0.9
+        ETH: 1.0
+        SOL: 1.4
+        BNB: 1.4
+        XRP: 1.6
+    entry_rules:
+      edge_threshold_pct:
+        BTC: 3.8
+        ETH: 4.0
+        SOL: 5.5
+        BNB: 5.5
+        XRP: 6.2
