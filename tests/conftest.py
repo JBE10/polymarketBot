@@ -42,6 +42,7 @@ def settings(tmp_path: Path) -> Settings:
     """Settings with temp DB, dry-run enabled, and no real API keys."""
     return Settings(
         dry_run=True,
+        quant_only_mode=False,
         data_dir=tmp_path / "data",
         gemini_api_key="",
         llm_provider="ollama",
@@ -53,6 +54,12 @@ def settings(tmp_path: Path) -> Settings:
         spread_target=0.02,
         max_mm_markets=3,
         mm_order_size_usd=25.0,
+        mm_min_market_volume_24h_usd=0.0,
+        mm_min_market_liquidity_usd=0.0,
+        mm_discovery_focus="crypto",
+        mm_min_recent_range=0.0,
+        mm_min_recent_trades=5,
+        mm_blacklist_enabled=False,
         max_consecutive_losses=3,
         min_book_depth_usd=500.0,
         kelly_fraction=0.25,

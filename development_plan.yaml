@@ -42,7 +42,7 @@ phases:
 
   - id: P3
     name: execution_resilience
-    status: in_progress
+    status: completed
     window_days: 2
     deliverables:
       - idempotency_and_requote_validation
@@ -53,7 +53,7 @@ phases:
 
   - id: P4
     name: observability_and_replay
-    status: pending
+    status: completed
     window_days: 2
     deliverables:
       - decision_snapshot_schema
@@ -65,7 +65,7 @@ phases:
 
   - id: P5
     name: paper_validation_gate
-    status: pending
+    status: in_progress
     window_days: 14
     deliverables:
       - promotion_report_demo_to_real
@@ -86,10 +86,10 @@ baseline:
 
 next_actions:
   - "Run wider suite and classify remaining failures by module"
-  - "Wire kill-switch counters to runtime execution flow"
-  - "Add integration tests for repeated API/order failure streaks"
-  - "Add retry coverage for market data HTTP paths under 429/5xx"
-  - "Prepare P3 completion report with incident scenarios"
+  - "Start P5 paper validation run and collect >=150 trade sample"
+  - "Track EV/trade, profit factor, and max drawdown daily"
+  - "Generate promotion report Demo -> Real with incident log"
+  - "Prepare rollout checklist for staged go-live"
 
 acceptance_metrics:
   quality:

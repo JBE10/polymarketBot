@@ -56,15 +56,10 @@ class Settings(BaseSettings):
     openai_model: str = Field("gpt-4o-mini", description="Modelo OpenAI (si se usa)")
     openai_embedding_model: str = Field("text-embedding-3-small", description="Embedding OpenAI (si se usa)")
 
-    # ── Crypto Price Context (replaces Tavily — no API key required) ─────────
-    crypto_context_enabled: bool = Field(
-        True, description="Fetch live crypto prices from public APIs (CoinGecko/Binance) for short-term context"
-    )
-    crypto_context_symbols: str = Field(
-        "BTC,ETH,SOL,MATIC",
-        description="Comma-separated symbols to fetch for market context",
-    )
-    crypto_context_timeout_s: int = Field(5, ge=1, le=30, description="Timeout in seconds for price API calls")
+    # ── Web Search (Tavily) ───────────────────────────────────────────────────
+    tavily_api_key: str = Field("", description="Tavily API key para busqueda web (gratis 1000/mes)")
+    web_search_enabled: bool = Field(True, description="Activar busqueda web antes de cada evaluacion LLM")
+    web_search_max_results: int = Field(5, ge=1, le=10, description="Maximo de resultados de busqueda web")
 
     # ── Polymarket wallet ─────────────────────────────────────────────────────
     polymarket_wallet_address: str = Field(
@@ -110,26 +105,8 @@ class Settings(BaseSettings):
         description="Sell when price drops this fraction below entry (0.15 = -15%)",
     )
     exit_days_before_end: float = Field(
-        0.0, ge=0.0,
-        description="Sell open positions this many days before market resolution. 0 = hold until resolution.",
-    )
-
-    # ── Short-term Market Settings ────────────────────────────────────────────
-    enable_short_term_markets: bool = Field(
-        True, description="Allow markets resolving in less than 1 day (e.g. 5-minute/10-minute crypto pools)"
-    )
-    short_term_max_minutes: int = Field(
-        120, ge=1, le=1440,
-        description="Markets resolving within this many minutes are classified as SHORT_TERM",
-    )
-    short_term_min_liquidity_usd: float = Field(
-        500.0, ge=0.0, description="Minimum liquidity (USD) for short-term markets (lower than standard threshold)"
-    )
-    short_term_min_volume_usd: float = Field(
-        100.0, ge=0.0, description="Minimum 24h volume (USD) for short-term markets"
-    )
-    short_term_cycle_seconds: int = Field(
-        30, gt=0, description="Evaluation cycle interval for short-term markets (should be << pool duration)"
+        1.0, ge=0.0,
+        description="Sell open positions this many days before market resolution (avoids binary risk)",
     )
 
     # ── Market-making (spread capture) ────────────────────────────────────────
@@ -141,13 +118,72 @@ class Settings(BaseSettings):
     max_mm_markets: int = Field(5, gt=0, description="Max markets to make simultaneously")
     mm_cycle_seconds: int = Field(5, gt=0, description="Fast-loop interval for order management")
     mm_order_size_usd: float = Field(25.0, gt=0, description="Fixed USD size per market-making order")
+    mm_min_market_volume_24h_usd: float = Field(
+        250_000.0,
+        ge=0.0,
+        description="Minimum 24h market volume required for MM entry",
+    )
+    mm_min_market_liquidity_usd: float = Field(
+        300_000.0,
+        ge=0.0,
+        description="Minimum market liquidity required for MM entry",
+    )
     max_consecutive_losses: int = Field(3, gt=0, description="Circuit breaker: halt after N consecutive losses")
     min_book_depth_usd: float = Field(500.0, ge=0, description="Minimum order-book depth to trade")
     mm_stale_order_seconds: int = Field(30, gt=0, description="Cancel unfilled BUY orders older than this many seconds")
+    mm_min_entry_price: float = Field(
+        0.25,
+        ge=0.01,
+        le=0.99,
+        description="Block MM entries below this YES price to avoid tail-risk zones",
+    )
+    mm_max_entry_price: float = Field(
+        0.75,
+        ge=0.01,
+        le=0.99,
+        description="Block MM entries above this YES price to avoid tail-risk zones",
+    )
+    mm_stop_loss_pct: float = Field(
+        0.06,
+        ge=0.01,
+        le=0.50,
+        description="MM-specific stop-loss fraction from entry (0.06 = -6%)",
+    )
+    mm_max_hold_seconds: int = Field(
+        3600,
+        gt=0,
+        description="Force-close MM position after this many seconds if target sell has not filled",
+    )
+    mm_toxicity_threshold: float = Field(
+        0.40,
+        ge=0.0,
+        le=1.0,
+        description="Block MM entries when recent toxic fill ratio exceeds this threshold",
+    )
+    mm_blacklist_enabled: bool = Field(
+        True,
+        description="Enable automatic market blacklist based on recent MM performance",
+    )
+    mm_blacklist_lookback_trades: int = Field(
+        12,
+        gt=0,
+        description="Number of recent closed rounds to evaluate per market for blacklist checks",
+    )
+    mm_blacklist_min_trades: int = Field(
+        3,
+        gt=0,
+        description="Minimum closed rounds required before blacklist logic applies",
+    )
+    mm_blacklist_min_win_rate: float = Field(
+        0.40,
+        ge=0.0,
+        le=1.0,
+        description="Minimum acceptable win rate per market (0.40 = 40%)",
+    )
 
     # ── Microstructure (MM defense) ────────────────────────────────────────────
-    obi_block_threshold: float = Field(-0.3, ge=-1.0, le=0.0, description="Block MM entry when OBI is below this (sell pressure)")
-    max_effective_spread: float = Field(0.10, ge=0.01, le=0.50, description="Block MM when book spread > this value")
+    obi_block_threshold: float = Field(-0.15, ge=-1.0, le=0.0, description="Block MM entry when OBI is below this (sell pressure)")
+    max_effective_spread: float = Field(0.06, ge=0.01, le=0.50, description="Block MM when book spread > this value")
     toxicity_lookback: int = Field(5, ge=1, description="Number of recent fills to evaluate for toxicity")
 
     # ── Bot cadence ───────────────────────────────────────────────────────────
@@ -211,6 +247,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _ensure_data_dir(self) -> "Settings":
+        if self.mm_min_entry_price >= self.mm_max_entry_price:
+            raise ValueError("mm_min_entry_price must be lower than mm_max_entry_price")
+        if self.mm_blacklist_lookback_trades < self.mm_blacklist_min_trades:
+            raise ValueError("mm_blacklist_lookback_trades must be >= mm_blacklist_min_trades")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.chroma_path.mkdir(parents=True, exist_ok=True)
         return self

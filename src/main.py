@@ -10,9 +10,7 @@ Startup sequence
 5.  Initialise the Polymarket CLOB client and derive API credentials.
 6.  Start the ChromaDB / LlamaIndex RAG engine.
 7.  Enter the main evaluation loop (every CYCLE_INTERVAL_SECONDS).
-8.  If ENABLE_SHORT_TERM_MARKETS=true, also run a fast short-term loop
-    (every SHORT_TERM_CYCLE_SECONDS) for ultra-short crypto pools.
-9.  On SIGINT/SIGTERM: drain in-flight tasks, close connections, exit cleanly.
+8.  On SIGINT/SIGTERM: drain in-flight tasks, close connections, exit cleanly.
 
 Run
 ---
@@ -174,37 +172,6 @@ async def _fast_loop(maker: MarketMaker, db: Database, cfg) -> None:
             pass
 
 
-async def _short_term_loop(evaluator: LLMEvaluator, provider, cfg) -> None:
-    """Short-term crypto pool evaluation loop (every SHORT_TERM_CYCLE_SECONDS).
-
-    Runs faster than the standard LLM cycle specifically to catch ultra-short
-    pools like "Will BTC go up in the next 10 minutes?" before they expire.
-    Uses real-time microstructure data (order book imbalance, momentum) instead
-    of RAG or web search.
-    """
-    cycle = 0
-    while not _shutdown_event.is_set():
-        cycle += 1
-        log.info("─── Short-term Cycle %d ───", cycle)
-
-        try:
-            bankroll = await _get_bankroll(provider, cfg)
-            summary = await evaluator.run_short_term_cycle(bankroll=bankroll)
-            if any(v > 0 for v in summary.values()):
-                log.info("[ST] cycle summary: %s", summary)
-
-        except Exception as exc:
-            log.exception("Unexpected error in short-term cycle %d: %s", cycle, exc)
-
-        try:
-            await asyncio.wait_for(
-                _shutdown_event.wait(),
-                timeout=cfg.short_term_cycle_seconds,
-            )
-        except asyncio.TimeoutError:
-            pass
-
-
 # ── Health check server ───────────────────────────────────────────────────────
 
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -348,27 +315,11 @@ async def main() -> None:
     ]
     if cfg.mm_enabled:
         loops.append(_fast_loop(maker, db, cfg))
-        log.info(
-            "Starting dual loops: LLM (every %ds) + MM (every %ds)",
-            cfg.cycle_interval_seconds, cfg.mm_cycle_seconds,
-        )
+        log.info("Starting dual loops: LLM (every %ds) + MM (every %ds)",
+                 cfg.cycle_interval_seconds, cfg.mm_cycle_seconds)
     else:
-        log.info(
-            "Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
-            cfg.cycle_interval_seconds,
-        )
-
-    if cfg.enable_short_term_markets:
-        loops.append(_short_term_loop(evaluator, provider, cfg))
-        log.info(
-            "Short-term market loop enabled (every %ds, max %d min pools)",
-            cfg.short_term_cycle_seconds,
-            cfg.short_term_max_minutes,
-        )
-    else:
-        log.info(
-            "Short-term markets disabled — set ENABLE_SHORT_TERM_MARKETS=true to activate",
-        )
+        log.info("Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
+                 cfg.cycle_interval_seconds)
 
     try:
         await notifier.send_message(f"Bot Iniciado | Dry Run: {cfg.dry_run} | MM: {cfg.mm_enabled}")

@@ -5,8 +5,9 @@ Stores: orders, positions, LLM evaluations, and RAG ingest log.
 from __future__ import annotations
 
 import logging
+import json
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
@@ -117,12 +118,57 @@ CREATE TABLE IF NOT EXISTS mm_fills (
     filled_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS decision_snapshots (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    asset                TEXT    NOT NULL,
+    market_id            TEXT    NOT NULL,
+    side                 TEXT    NOT NULL,       -- UP | DOWN | N/A
+    action               TEXT    NOT NULL,       -- BUY | SKIP
+    reason_code          TEXT    NOT NULL,
+    regime               TEXT    NOT NULL,       -- LOW_VOL | MID_VOL | HIGH_VOL
+    p_model_up           REAL,
+    p_market_up          REAL,
+    edge_net_pct         REAL,
+    score                REAL,
+    threshold_pct        REAL,
+    total_cost_pct       REAL,
+    fee_pct              REAL,
+    slippage_pct         REAL,
+    latency_buffer_pct   REAL,
+    notional_usd         REAL,
+    spread_pct           REAL,
+    depth_usd            REAL,
+    expiry_utc           TEXT,
+    feature_ema_fast     REAL,
+    feature_ema_slow     REAL,
+    feature_rsi          REAL,
+    feature_momentum     REAL,
+    feature_atr_pctile   REAL,
+    meta_json            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS operational_incidents (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc               TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    source               TEXT    NOT NULL,
+    severity             TEXT    NOT NULL,       -- INFO | WARN | SEVERE
+    incident_type        TEXT    NOT NULL,
+    message              TEXT    NOT NULL,
+    details_json         TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_market      ON orders(market_id);
 CREATE INDEX IF NOT EXISTS idx_positions_market   ON positions(market_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_mkt    ON evaluations(market_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_mm_rounds_market   ON mm_rounds(market_id, status);
 CREATE INDEX IF NOT EXISTS idx_mm_fills_market    ON mm_fills(market_id, filled_at);
 CREATE INDEX IF NOT EXISTS idx_calibration_market ON llm_calibration(market_id);
+CREATE INDEX IF NOT EXISTS idx_decision_ts        ON decision_snapshots(decision_ts);
+CREATE INDEX IF NOT EXISTS idx_decision_asset_ts  ON decision_snapshots(asset, decision_ts);
+CREATE INDEX IF NOT EXISTS idx_decision_market_ts ON decision_snapshots(market_id, decision_ts);
+CREATE INDEX IF NOT EXISTS idx_incidents_ts        ON operational_incidents(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_incidents_severity  ON operational_incidents(severity, ts_utc);
 """
 
 
@@ -620,5 +666,353 @@ class Database:
         fills = await self.get_recent_mm_fills(market_id, lookback)
         if not fills:
             return 0.0
-        toxic = sum(1 for f in fills if (f.get("adverse_move") or 0) > 0.005)
+        toxic = sum(1 for f in fills if (f.get("adverse_move") or 0) >= 0.005)
         return toxic / len(fills)
+
+    async def get_mm_closed_rounds(
+        self,
+        *,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+        limit: int = 100000,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        query = """
+            SELECT id, market_id, realized_pnl, rebate_est, closed_at
+            FROM mm_rounds
+            WHERE status = 'CLOSED'
+        """
+        params: list[Any] = []
+
+        if start_ts:
+            query += " AND closed_at >= ?"
+            params.append(start_ts)
+        if end_ts:
+            query += " AND closed_at <= ?"
+            params.append(end_ts)
+
+        query += " ORDER BY closed_at ASC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_mm_performance_summary(
+        self,
+        *,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> dict[str, float | int]:
+        rounds = await self.get_mm_closed_rounds(start_ts=start_ts, end_ts=end_ts)
+        pnl_values = [float((r.get("realized_pnl") or 0.0) + (r.get("rebate_est") or 0.0)) for r in rounds]
+
+        wins = sum(1 for p in pnl_values if p > 0)
+        losses = sum(1 for p in pnl_values if p < 0)
+        gross_profit = sum(p for p in pnl_values if p > 0)
+        gross_loss = abs(sum(p for p in pnl_values if p < 0))
+        net_pnl = sum(pnl_values)
+        total = len(pnl_values)
+
+        return {
+            "trades": total,
+            "wins": wins,
+            "losses": losses,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "net_pnl": net_pnl,
+            "ev_per_trade": (net_pnl / total) if total else 0.0,
+        }
+
+    async def get_mm_market_stats(
+        self,
+        market_id: str,
+        *,
+        lookback: int = 12,
+    ) -> dict[str, float | int]:
+        """Return recent per-market MM summary for blacklist and diagnostics."""
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT realized_pnl, rebate_est
+            FROM mm_rounds
+            WHERE status = 'CLOSED' AND market_id = ?
+            ORDER BY closed_at DESC
+            LIMIT ?
+            """,
+            (market_id, lookback),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        pnl_values = [float((r["realized_pnl"] or 0.0) + (r["rebate_est"] or 0.0)) for r in rows]
+        trades = len(pnl_values)
+        wins = sum(1 for p in pnl_values if p > 0)
+        losses = sum(1 for p in pnl_values if p < 0)
+        net_pnl = sum(pnl_values)
+
+        return {
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "net_pnl": net_pnl,
+            "win_rate": (wins / trades) if trades else 0.0,
+        }
+
+    # ── Decision snapshots (P4 replay/observability) ─────────────────────
+
+    async def insert_decision_snapshot(
+        self,
+        *,
+        decision_ts: str | None = None,
+        asset: str,
+        market_id: str,
+        side: str,
+        action: str,
+        reason_code: str,
+        regime: str,
+        p_model_up: float | None,
+        p_market_up: float | None,
+        edge_net_pct: float | None,
+        score: float | None,
+        threshold_pct: float | None,
+        total_cost_pct: float | None,
+        fee_pct: float | None,
+        slippage_pct: float | None,
+        latency_buffer_pct: float | None,
+        notional_usd: float | None,
+        spread_pct: float | None,
+        depth_usd: float | None,
+        expiry_utc: str | None,
+        feature_ema_fast: float | None,
+        feature_ema_slow: float | None,
+        feature_rsi: float | None,
+        feature_momentum: float | None,
+        feature_atr_pctile: float | None,
+        meta: dict[str, Any] | None = None,
+    ) -> int:
+        async with self._tx() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO decision_snapshots (
+                    decision_ts, asset, market_id, side, action, reason_code, regime,
+                    p_model_up, p_market_up, edge_net_pct, score,
+                    threshold_pct, total_cost_pct, fee_pct, slippage_pct, latency_buffer_pct,
+                    notional_usd, spread_pct, depth_usd, expiry_utc,
+                    feature_ema_fast, feature_ema_slow, feature_rsi, feature_momentum,
+                    feature_atr_pctile, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_ts or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    asset,
+                    market_id,
+                    side,
+                    action,
+                    reason_code,
+                    regime,
+                    p_model_up,
+                    p_market_up,
+                    edge_net_pct,
+                    score,
+                    threshold_pct,
+                    total_cost_pct,
+                    fee_pct,
+                    slippage_pct,
+                    latency_buffer_pct,
+                    notional_usd,
+                    spread_pct,
+                    depth_usd,
+                    expiry_utc,
+                    feature_ema_fast,
+                    feature_ema_slow,
+                    feature_rsi,
+                    feature_momentum,
+                    feature_atr_pctile,
+                    json.dumps(meta or {}, sort_keys=True),
+                ),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    async def get_decision_snapshots(
+        self,
+        *,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+        asset: str | None = None,
+        market_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        query = "SELECT * FROM decision_snapshots WHERE 1=1"
+        params: list[Any] = []
+
+        if start_ts:
+            query += " AND decision_ts >= ?"
+            params.append(start_ts)
+        if end_ts:
+            query += " AND decision_ts <= ?"
+            params.append(end_ts)
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+        if market_id:
+            query += " AND market_id = ?"
+            params.append(market_id)
+
+        query += " ORDER BY decision_ts DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        out = [dict(r) for r in rows]
+        for row in out:
+            raw_meta = row.get("meta_json")
+            try:
+                row["meta"] = json.loads(raw_meta) if raw_meta else {}
+            except Exception:
+                row["meta"] = {}
+        return out
+
+    async def get_daily_decision_report(
+        self,
+        *,
+        date_utc: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return daily aggregates by asset/regime/hour/side for observability."""
+        assert self._db
+        target_date = date_utc or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        by_asset_sql = """
+            SELECT
+                asset,
+                COUNT(*) AS total_decisions,
+                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buy_decisions,
+                AVG(COALESCE(edge_net_pct, 0)) AS avg_edge_net_pct,
+                AVG(COALESCE(score, 0)) AS avg_score,
+                SUM(COALESCE(notional_usd, 0)) AS total_notional_usd
+            FROM decision_snapshots
+            WHERE date(decision_ts) = date(?)
+            GROUP BY asset
+            ORDER BY asset
+        """
+
+        by_regime_sql = """
+            SELECT
+                regime,
+                COUNT(*) AS total_decisions,
+                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buy_decisions,
+                AVG(COALESCE(edge_net_pct, 0)) AS avg_edge_net_pct
+            FROM decision_snapshots
+            WHERE date(decision_ts) = date(?)
+            GROUP BY regime
+            ORDER BY regime
+        """
+
+        by_hour_sql = """
+            SELECT
+                strftime('%H', decision_ts) AS hour_utc,
+                COUNT(*) AS total_decisions,
+                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buy_decisions,
+                AVG(COALESCE(edge_net_pct, 0)) AS avg_edge_net_pct
+            FROM decision_snapshots
+            WHERE date(decision_ts) = date(?)
+            GROUP BY hour_utc
+            ORDER BY hour_utc
+        """
+
+        by_side_sql = """
+            SELECT
+                side,
+                COUNT(*) AS total_decisions,
+                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buy_decisions,
+                AVG(COALESCE(edge_net_pct, 0)) AS avg_edge_net_pct
+            FROM decision_snapshots
+            WHERE date(decision_ts) = date(?)
+            GROUP BY side
+            ORDER BY side
+        """
+
+        async with self._db.execute(by_asset_sql, (target_date,)) as cur:
+            by_asset = [dict(r) for r in await cur.fetchall()]
+        async with self._db.execute(by_regime_sql, (target_date,)) as cur:
+            by_regime = [dict(r) for r in await cur.fetchall()]
+        async with self._db.execute(by_hour_sql, (target_date,)) as cur:
+            by_hour = [dict(r) for r in await cur.fetchall()]
+        async with self._db.execute(by_side_sql, (target_date,)) as cur:
+            by_side = [dict(r) for r in await cur.fetchall()]
+
+        return {
+            "date_utc": [{"date": target_date}],
+            "by_asset": by_asset,
+            "by_regime": by_regime,
+            "by_hour": by_hour,
+            "by_side": by_side,
+        }
+
+    # ── Operational incidents (P5 promotion gate) ─────────────────────────
+
+    async def insert_operational_incident(
+        self,
+        *,
+        source: str,
+        severity: str,
+        incident_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        severity_upper = severity.upper()
+        if severity_upper not in {"INFO", "WARN", "SEVERE"}:
+            raise ValueError("severity must be INFO, WARN, or SEVERE")
+
+        async with self._tx() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO operational_incidents
+                    (source, severity, incident_type, message, details_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    severity_upper,
+                    incident_type,
+                    message,
+                    json.dumps(details or {}, sort_keys=True),
+                ),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    async def get_operational_incidents(
+        self,
+        *,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+        severity: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        query = "SELECT * FROM operational_incidents WHERE 1=1"
+        params: list[Any] = []
+
+        if start_ts:
+            query += " AND ts_utc >= ?"
+            params.append(start_ts)
+        if end_ts:
+            query += " AND ts_utc <= ?"
+            params.append(end_ts)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity.upper())
+
+        query += " ORDER BY ts_utc DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        out = [dict(r) for r in rows]
+        for row in out:
+            raw = row.get("details_json")
+            try:
+                row["details"] = json.loads(raw) if raw else {}
+            except Exception:
+                row["details"] = {}
+        return out

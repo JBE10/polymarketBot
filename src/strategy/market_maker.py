@@ -31,6 +31,8 @@ log = logging.getLogger(__name__)
 
 # Polymarket maker rebate estimate (25% of taker fee which is ~2%)
 _REBATE_RATE = 0.005
+_DEFENSIVE_OBI_THRESHOLD = -0.15
+_DEFENSIVE_MAX_EFFECTIVE_SPREAD = 0.06
 
 
 @dataclass
@@ -45,6 +47,7 @@ class _MarketSlot:
     sell_price: float = 0.0
     shares: float = 0.0
     posted_at: float = 0.0  # time.time() when BUY was posted
+    bought_at: float = 0.0  # time.time() when BUY fill was confirmed
     state: str = "IDLE"   # IDLE | BUY_POSTED | BOUGHT | SELL_POSTED
 
 
@@ -68,9 +71,12 @@ class MarketMaker:
         self._regime = RegimeFilter(
             max_consecutive_losses=settings.max_consecutive_losses,
         )
+        obi_threshold = max(settings.obi_block_threshold, _DEFENSIVE_OBI_THRESHOLD)
+        max_effective_spread = min(settings.max_effective_spread, _DEFENSIVE_MAX_EFFECTIVE_SPREAD)
+        self._obi_threshold = obi_threshold
         self._micro = MicrostructureAnalyzer(
-            obi_threshold=settings.obi_block_threshold,
-            max_spread=settings.max_effective_spread,
+            obi_threshold=obi_threshold,
+            max_spread=max_effective_spread,
         )
         self._slots: dict[str, _MarketSlot] = {}
         self._approved_markets: dict[str, Market] = {}
@@ -152,6 +158,9 @@ class MarketMaker:
         """Check regime + microstructure, fetch book, post a passive BUY at best_bid."""
         market = slot.market
 
+        if not await self._passes_market_quality_filters(market):
+            return {}
+
         # -- Regime filter --
         losses = await self._db.get_consecutive_losses(market.condition_id)
         trades = await self._clob.get_trades(slot.token_id, limit=30)
@@ -184,6 +193,7 @@ class MarketMaker:
             book=book,
             spread_target=self._cfg.spread_target,
             toxicity_ratio=toxicity,
+            toxicity_threshold=self._cfg.mm_toxicity_threshold,
         )
         if not signal.is_safe:
             log.info("MM micro blocked %s: %s", market.question[:40], signal.block_reason)
@@ -192,6 +202,12 @@ class MarketMaker:
         # -- Calculate order params --
         buy_price = book.best_bid
         if buy_price <= 0.01 or buy_price >= 0.99:
+            return {}
+        if buy_price < self._cfg.mm_min_entry_price or buy_price > self._cfg.mm_max_entry_price:
+            log.debug(
+                "MM entry blocked by price band for %s: buy=%.3f outside [%.3f, %.3f]",
+                market.question[:40], buy_price, self._cfg.mm_min_entry_price, self._cfg.mm_max_entry_price,
+            )
             return {}
 
         shares = self._cfg.mm_order_size_usd / buy_price
@@ -270,7 +286,7 @@ class MarketMaker:
             book = await self._clob.get_order_book(slot.token_id)
         if not filled and book is not None:
             obi = self._micro.order_book_imbalance(book)
-            if obi < self._cfg.obi_block_threshold:
+            if obi < self._obi_threshold:
                 log.info(
                     "[MM] OBI cancel: '%s' OBI=%.2f — pulling buy order",
                     slot.market.question[:40], obi,
@@ -298,6 +314,7 @@ class MarketMaker:
                     fill_price=slot.buy_price,
                     mid_price_after=mid,
                 )
+            slot.bought_at = time.time()
             slot.state = "BOUGHT"
             return await self._handle_bought(slot)
 
@@ -305,6 +322,8 @@ class MarketMaker:
 
     async def _handle_bought(self, slot: _MarketSlot) -> dict[str, int]:
         """Post a SELL order at entry + spread_target."""
+        if slot.bought_at <= 0:
+            slot.bought_at = time.time()
         sell_price = min(slot.buy_price + self._cfg.spread_target, 0.99)
 
         order_id: str | None = None
@@ -341,6 +360,7 @@ class MarketMaker:
         """Check if the SELL order has been filled; also check stop-loss and trailing exit."""
         filled = False
         stop_hit = False
+        timed_out = False
 
         book = await self._clob.get_order_book(slot.token_id)
 
@@ -348,7 +368,7 @@ class MarketMaker:
             if book and book.best_bid is not None and book.best_bid >= slot.sell_price:
                 filled = True
             elif book and book.mid_price is not None:
-                sl_price = slot.buy_price * (1 - self._cfg.stop_loss_pct)
+                sl_price = slot.buy_price * (1 - self._cfg.mm_stop_loss_pct)
                 if book.mid_price <= sl_price:
                     stop_hit = True
         else:
@@ -357,8 +377,13 @@ class MarketMaker:
             if slot.sell_order_id and slot.sell_order_id not in order_ids:
                 filled = True
 
+        if not filled and slot.bought_at > 0:
+            held_seconds = time.time() - slot.bought_at
+            if held_seconds >= self._cfg.mm_max_hold_seconds:
+                timed_out = True
+
         # -- Trailing exit: if price moved well above our sell, raise the sell --
-        if not filled and not stop_hit and book and book.best_bid is not None:
+        if not filled and not stop_hit and not timed_out and book and book.best_bid is not None:
             trail_threshold = slot.sell_price + self._cfg.spread_target
             if book.best_bid > trail_threshold:
                 new_sell = min(book.best_bid, 0.99)
@@ -411,14 +436,26 @@ class MarketMaker:
             self._reset_slot(slot)
             return {"profits": 1}
 
-        if stop_hit:
-            exit_price = book.mid_price if book and book.mid_price else slot.buy_price * 0.9
+        if stop_hit or timed_out:
+            if book and book.best_bid is not None:
+                exit_price = book.best_bid
+            elif book and book.mid_price is not None:
+                exit_price = book.mid_price
+            else:
+                exit_price = slot.buy_price * (1 - self._cfg.mm_stop_loss_pct)
             pnl = slot.shares * (exit_price - slot.buy_price)
 
-            log.info(
-                "[MM] STOP-LOSS: '%s' buy=%.3f exit=%.3f pnl=%+.4f",
-                slot.market.question[:40], slot.buy_price, exit_price, pnl,
-            )
+            if stop_hit:
+                log.info(
+                    "[MM] STOP-LOSS: '%s' buy=%.3f exit=%.3f pnl=%+.4f",
+                    slot.market.question[:40], slot.buy_price, exit_price, pnl,
+                )
+            else:
+                held_minutes = (time.time() - slot.bought_at) / 60 if slot.bought_at > 0 else 0.0
+                log.info(
+                    "[MM] TIME-STOP: '%s' held=%.1fmin buy=%.3f exit=%.3f pnl=%+.4f",
+                    slot.market.question[:40], held_minutes, slot.buy_price, exit_price, pnl,
+                )
 
             if not self._cfg.dry_run and slot.sell_order_id:
                 await self._clob.cancel_order(slot.sell_order_id)
@@ -427,11 +464,54 @@ class MarketMaker:
                 await self._db.close_mm_round(slot.round_id, exit_price, pnl, 0.0)
 
             self._reset_slot(slot)
-            return {"losses": 1}
+            if pnl > 0:
+                return {"profits": 1}
+            if pnl < 0:
+                return {"losses": 1}
+            return {}
 
         return {}
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    async def _passes_market_quality_filters(self, market: Market) -> bool:
+        if market.volume_24hr < self._cfg.mm_min_market_volume_24h_usd:
+            log.debug(
+                "MM market blocked (volume): %s vol24h=%.0f < %.0f",
+                market.question[:40], market.volume_24hr, self._cfg.mm_min_market_volume_24h_usd,
+            )
+            return False
+
+        if market.liquidity < self._cfg.mm_min_market_liquidity_usd:
+            log.debug(
+                "MM market blocked (liquidity): %s liq=%.0f < %.0f",
+                market.question[:40], market.liquidity, self._cfg.mm_min_market_liquidity_usd,
+            )
+            return False
+
+        if not self._cfg.mm_blacklist_enabled:
+            return True
+
+        stats = await self._db.get_mm_market_stats(
+            market.condition_id,
+            lookback=self._cfg.mm_blacklist_lookback_trades,
+        )
+        trades = int(stats.get("trades", 0))
+        wins = int(stats.get("wins", 0))
+        net_pnl = float(stats.get("net_pnl", 0.0))
+
+        if trades < self._cfg.mm_blacklist_min_trades:
+            return True
+
+        win_rate = (wins / trades) if trades else 0.0
+        should_block = wins == 0 or (win_rate < self._cfg.mm_blacklist_min_win_rate and net_pnl <= 0)
+        if should_block:
+            log.info(
+                "MM blacklist blocked %s: trades=%d wins=%d win_rate=%.1f%% net=%+.4f",
+                market.question[:40], trades, wins, win_rate * 100.0, net_pnl,
+            )
+            return False
+        return True
 
     def _reset_slot(self, slot: _MarketSlot) -> None:
         slot.state = "IDLE"
@@ -442,6 +522,7 @@ class MarketMaker:
         slot.sell_price = 0.0
         slot.shares = 0.0
         slot.posted_at = 0.0
+        slot.bought_at = 0.0
 
     async def _cancel_slot(self, slot: _MarketSlot) -> None:
         """Cancel any outstanding orders and mark round as cancelled."""
