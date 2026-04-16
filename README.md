@@ -42,6 +42,63 @@ python3 -m venv .venv
 
 ---
 
+## Bot Quick Commands
+
+Run the bot in dry-run mode (using current `.env`):
+
+```bash
+cd /Users/juanbautistaespino/Documents/polymarketBot && source .venv/bin/activate && python main.py
+```
+
+Run A/B paper mode with dump+hedge 15m enabled (keeps current bot + adds DH15M loop):
+
+```bash
+cd /Users/juanbautistaespino/Documents/polymarketBot && source .venv/bin/activate && DH15M_ENABLED=true DRY_RUN=true python -m src.main
+```
+
+Open a live terminal dashboard (orders, win rate, P&L, balance estimate, incidents):
+
+```bash
+cd /Users/juanbautistaespino/Documents/polymarketBot && source .venv/bin/activate && python scripts/terminal_dashboard.py --repo . --health-port 8080 --refresh 2
+```
+
+Compute daily combined performance (LLM + MM), including trades, win rate, and net P&L:
+
+```bash
+cd /Users/juanbautistaespino/Documents/polymarketBot && { rg --no-filename "Position CLOSED .*realized_pnl=" logs/bot.log* | perl -ne 'if(/^(\d{4}-\d{2}-\d{2}).*realized_pnl=([+-]?\d+\.\d+)/){print "$1 $2\n"}'; rg --no-filename "\[MM\] SELL FILLED" logs/bot.log* | perl -ne 'if(/^(\d{4}-\d{2}-\d{2}).*total=([+-]?\d+\.\d+)/){print "$1 $2\n"}'; rg --no-filename "\[MM\] (STOP-LOSS|TIME-STOP)" logs/bot.log* | perl -ne 'if(/^(\d{4}-\d{2}-\d{2}).*pnl=([+-]?\d+\.\d+)/){print "$1 $2\n"}'; } | awk 'NF==2{d=$1;p=$2+0;n[d]++;s[d]+=p;if(p>0)w[d]++;else if(p<0)l[d]++} END{for (d in n){wr=(n[d]?100*w[d]/n[d]:0);printf("%s trades=%d wr=%.1f%% net=%+.4f\n",d,n[d],wr,s[d])}}' | sort
+```
+
+Run the bot in background (recommended for long sessions):
+
+```bash
+nohup /Users/juanbautistaespino/Documents/polymarketBot/.venv/bin/python /Users/juanbautistaespino/Documents/polymarketBot/main.py >> /Users/juanbautistaespino/Documents/polymarketBot/logs/bot.log 2>&1 & echo $! > /Users/juanbautistaespino/Documents/polymarketBot/.bot.pid
+```
+
+Check if it is active:
+
+```bash
+pgrep -af "polymarketBot/main.py"
+```
+
+Watch logs live:
+
+```bash
+tail -f /Users/juanbautistaespino/Documents/polymarketBot/logs/bot.log
+```
+
+Stop the bot cleanly:
+
+```bash
+kill "$(cat /Users/juanbautistaespino/Documents/polymarketBot/.bot.pid)"
+```
+
+About windows:
+- The terminal where you run `python main.py` is the bot process in foreground.
+- A terminal with `tail -f logs/bot.log` is only a live log viewer.
+- The README editor window is documentation only.
+
+---
+
 ## Keyboard Shortcuts
 
 | Key | Action |

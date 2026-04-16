@@ -19,10 +19,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 from src.core.config import Settings
 from src.core.database import Database
+from src.polymarket.book_cache import BookCache
 from src.polymarket.clob_client import AsyncClobClient
+from src.polymarket.fill_cache import FillCache
 from src.polymarket.models import Market, OrderBook, OrderRequest, OrderType, Side
 from src.strategy.microstructure import MicrostructureAnalyzer
 from src.strategy.regime_filter import RegimeFilter
@@ -53,21 +56,32 @@ class _MarketSlot:
 
 class MarketMaker:
     """
-    Manages spread-capture orders across multiple markets concurrently.
+    Spread-capture market maker — Trigger layer of the Brain/Trigger architecture.
 
-    The LLM evaluator feeds approved markets into `update_active_markets()`.
-    Each fast-loop tick, `run_tick()` advances the state machine for every slot.
+    Consumes ExecutionSignal / CancelSignal from Brain via asyncio.Queue.
+    Manages GTC order lifecycle: buy → fill detection → sell → profit log.
+
+    Fill detection is fully event-driven:
+    - In LIVE mode: UserWsClient pushes fill events into FillCache.
+      `is_filled(order_id)` is a non-blocking dict lookup — no HTTP.
+    - In DRY-RUN mode: fill is simulated against the BookCache best prices.
+    - Fallback: if FillCache has no data for an order (e.g., during WS reconnect
+      window), falls back to get_open_orders() HTTP as a safety net.
     """
 
     def __init__(
         self,
-        clob: AsyncClobClient,
-        db: Database,
-        settings: Settings,
+        clob:       AsyncClobClient,
+        db:         Database,
+        settings:   Settings,
+        fill_cache: Optional[FillCache]  = None,
+        book_cache: Optional[BookCache]  = None,
     ) -> None:
-        self._clob = clob
-        self._db = db
-        self._cfg = settings
+        self._clob       = clob
+        self._db         = db
+        self._cfg        = settings
+        self._fill_cache = fill_cache   # None → HTTP fallback always
+        self._book_cache = book_cache   # None → always HTTP for order book
         self._regime = RegimeFilter(
             max_consecutive_losses=settings.max_consecutive_losses,
         )
@@ -158,7 +172,9 @@ class MarketMaker:
         """Check regime + microstructure, fetch book, post a passive BUY at best_bid."""
         market = slot.market
 
-        if not await self._passes_market_quality_filters(market):
+        quality_ok, quality_reason, quality_detail = await self._passes_market_quality_filters(market)
+        if not quality_ok:
+            await self._record_rejection(slot, quality_reason or "quality", quality_detail)
             return {}
 
         # -- Regime filter --
@@ -172,16 +188,23 @@ class MarketMaker:
             consecutive_losses=losses,
         )
         if not verdict:
+            await self._record_rejection(slot, "regime", verdict.reason)
             log.debug("MM regime blocked %s: %s", market.question[:40], verdict.reason)
             return {}
 
         # -- Order book depth check --
         book = await self._clob.get_order_book(slot.token_id)
         if book is None or book.best_bid is None:
+            await self._record_rejection(slot, "book_missing", "book unavailable or best_bid missing")
             return {}
 
         bid_depth = book.depth_usd(Side.BUY, levels=5)
         if bid_depth < self._cfg.min_book_depth_usd:
+            await self._record_rejection(
+                slot,
+                "depth",
+                f"bid_depth={bid_depth:.2f} < min={self._cfg.min_book_depth_usd:.2f}",
+            )
             log.debug("MM depth too low for %s: $%.0f", market.question[:40], bid_depth)
             return {}
 
@@ -196,14 +219,21 @@ class MarketMaker:
             toxicity_threshold=self._cfg.mm_toxicity_threshold,
         )
         if not signal.is_safe:
+            await self._record_rejection(slot, self._micro_reason_code(signal.block_reason), signal.block_reason)
             log.info("MM micro blocked %s: %s", market.question[:40], signal.block_reason)
             return {}
 
         # -- Calculate order params --
         buy_price = book.best_bid
         if buy_price <= 0.01 or buy_price >= 0.99:
+            await self._record_rejection(slot, "price_extreme", f"buy_price={buy_price:.3f}")
             return {}
         if buy_price < self._cfg.mm_min_entry_price or buy_price > self._cfg.mm_max_entry_price:
+            await self._record_rejection(
+                slot,
+                "price_band",
+                f"buy={buy_price:.3f} outside [{self._cfg.mm_min_entry_price:.3f}, {self._cfg.mm_max_entry_price:.3f}]",
+            )
             log.debug(
                 "MM entry blocked by price band for %s: buy=%.3f outside [%.3f, %.3f]",
                 market.question[:40], buy_price, self._cfg.mm_min_entry_price, self._cfg.mm_max_entry_price,
@@ -272,10 +302,31 @@ class MarketMaker:
         book: OrderBook | None = None
 
         if self._cfg.dry_run:
-            book = await self._clob.get_order_book(slot.token_id)
+            # Dry-run: simulate fill from BookCache (if available) or CLOB HTTP
+            book = self._book_cache.get_order_book(slot.token_id) if self._book_cache else None
+            if book is None:
+                book = await self._clob.get_order_book(slot.token_id)
             if book and book.best_ask is not None and book.best_ask <= slot.buy_price:
                 filled = True
+
+        elif self._fill_cache is not None and slot.buy_order_id:
+            # LIVE mode: check FillCache first (non-blocking, zero HTTP)
+            if self._fill_cache.is_filled(slot.buy_order_id):
+                filled = True
+                self._fill_cache.consume(slot.buy_order_id)  # acknowledge
+            elif self._fill_cache.is_cancelled(slot.buy_order_id):
+                # Order was cancelled externally (unusual) — reset
+                self._fill_cache.consume(slot.buy_order_id)
+                log.warning(
+                    "[MM] BUY externally cancelled: '%s' — resetting slot",
+                    slot.market.question[:40],
+                )
+                self._reset_slot(slot)
+                return {}
+            # else: still OPEN — no action
+
         else:
+            # Fallback: HTTP polling (no FillCache, or no order_id)
             open_orders = await self._clob.get_open_orders()
             order_ids = {o.get("id") or o.get("orderID") for o in open_orders}
             if slot.buy_order_id and slot.buy_order_id not in order_ids:
@@ -283,7 +334,11 @@ class MarketMaker:
 
         # -- Aggressive OBI cancel: if sell pressure appeared, pull the order --
         if not filled and book is None:
-            book = await self._clob.get_order_book(slot.token_id)
+            # Need fresh book for OBI check — use cache if available
+            book = (
+                self._book_cache.get_order_book(slot.token_id)
+                if self._book_cache else None
+            ) or await self._clob.get_order_book(slot.token_id)
         if not filled and book is not None:
             obi = self._micro.order_book_imbalance(book)
             if obi < self._obi_threshold:
@@ -362,7 +417,11 @@ class MarketMaker:
         stop_hit = False
         timed_out = False
 
-        book = await self._clob.get_order_book(slot.token_id)
+        # Get current book — use cache if available, else HTTP
+        book = (
+            self._book_cache.get_order_book(slot.token_id)
+            if self._book_cache else None
+        ) or await self._clob.get_order_book(slot.token_id)
 
         if self._cfg.dry_run:
             if book and book.best_bid is not None and book.best_bid >= slot.sell_price:
@@ -371,7 +430,30 @@ class MarketMaker:
                 sl_price = slot.buy_price * (1 - self._cfg.mm_stop_loss_pct)
                 if book.mid_price <= sl_price:
                     stop_hit = True
+
+        elif self._fill_cache is not None and slot.sell_order_id:
+            # LIVE mode: event-driven fill detection — no HTTP
+            if self._fill_cache.is_filled(slot.sell_order_id):
+                filled = True
+                self._fill_cache.consume(slot.sell_order_id)  # acknowledge
+            elif self._fill_cache.is_cancelled(slot.sell_order_id):
+                # Sell was cancelled externally — this is unexpected; repost
+                self._fill_cache.consume(slot.sell_order_id)
+                log.warning(
+                    "[MM] SELL externally cancelled: '%s' @ %.3f — reposting",
+                    slot.market.question[:40], slot.sell_price,
+                )
+                slot.state = "BOUGHT"
+                return await self._handle_bought(slot)
+
+            # Stop-loss check from BookCache (same logic, no extra HTTP)
+            if not filled and book and book.mid_price is not None:
+                sl_price = slot.buy_price * (1 - self._cfg.mm_stop_loss_pct)
+                if book.mid_price <= sl_price:
+                    stop_hit = True
+
         else:
+            # Fallback: HTTP polling
             open_orders = await self._clob.get_open_orders()
             order_ids = {o.get("id") or o.get("orderID") for o in open_orders}
             if slot.sell_order_id and slot.sell_order_id not in order_ids:
@@ -474,23 +556,23 @@ class MarketMaker:
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    async def _passes_market_quality_filters(self, market: Market) -> bool:
+    async def _passes_market_quality_filters(self, market: Market) -> tuple[bool, str | None, str]:
         if market.volume_24hr < self._cfg.mm_min_market_volume_24h_usd:
             log.debug(
                 "MM market blocked (volume): %s vol24h=%.0f < %.0f",
                 market.question[:40], market.volume_24hr, self._cfg.mm_min_market_volume_24h_usd,
             )
-            return False
+            return False, "volume", f"vol24h={market.volume_24hr:.0f} < min={self._cfg.mm_min_market_volume_24h_usd:.0f}"
 
         if market.liquidity < self._cfg.mm_min_market_liquidity_usd:
             log.debug(
                 "MM market blocked (liquidity): %s liq=%.0f < %.0f",
                 market.question[:40], market.liquidity, self._cfg.mm_min_market_liquidity_usd,
             )
-            return False
+            return False, "liquidity", f"liq={market.liquidity:.0f} < min={self._cfg.mm_min_market_liquidity_usd:.0f}"
 
         if not self._cfg.mm_blacklist_enabled:
-            return True
+            return True, None, ""
 
         stats = await self._db.get_mm_market_stats(
             market.condition_id,
@@ -501,7 +583,7 @@ class MarketMaker:
         net_pnl = float(stats.get("net_pnl", 0.0))
 
         if trades < self._cfg.mm_blacklist_min_trades:
-            return True
+            return True, None, ""
 
         win_rate = (wins / trades) if trades else 0.0
         should_block = wins == 0 or (win_rate < self._cfg.mm_blacklist_min_win_rate and net_pnl <= 0)
@@ -510,8 +592,30 @@ class MarketMaker:
                 "MM blacklist blocked %s: trades=%d wins=%d win_rate=%.1f%% net=%+.4f",
                 market.question[:40], trades, wins, win_rate * 100.0, net_pnl,
             )
-            return False
-        return True
+            detail = f"trades={trades} wins={wins} win_rate={win_rate:.2%} net_pnl={net_pnl:+.4f}"
+            return False, "blacklist", detail
+        return True, None, ""
+
+    async def _record_rejection(self, slot: _MarketSlot, reason_code: str, detail: str = "") -> None:
+        await self._db.insert_mm_rejection(
+            market_id=slot.market.condition_id,
+            token_id=slot.token_id,
+            question=slot.market.question,
+            reason_code=reason_code,
+            detail=detail,
+            slot_state=slot.state,
+        )
+
+    @staticmethod
+    def _micro_reason_code(block_reason: str) -> str:
+        text = (block_reason or "").lower()
+        if "obi=" in text:
+            return "obi"
+        if "toxicity=" in text:
+            return "toxicity"
+        if "spread=" in text:
+            return "spread"
+        return "micro"
 
     def _reset_slot(self, slot: _MarketSlot) -> None:
         slot.state = "IDLE"

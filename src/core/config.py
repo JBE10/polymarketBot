@@ -118,6 +118,31 @@ class Settings(BaseSettings):
     max_mm_markets: int = Field(5, gt=0, description="Max markets to make simultaneously")
     mm_cycle_seconds: int = Field(5, gt=0, description="Fast-loop interval for order management")
     mm_order_size_usd: float = Field(25.0, gt=0, description="Fixed USD size per market-making order")
+    mm_independent_discovery_enabled: bool = Field(
+        True,
+        description="Allow MM to consume short-horizon markets even when LLM does not approve them",
+    )
+    mm_short_horizon_min_minutes: int = Field(
+        5,
+        ge=0,
+        description="Minimum minutes remaining for independent MM market discovery",
+    )
+    mm_short_horizon_max_hours: float = Field(
+        24.0,
+        gt=0.0,
+        description="Maximum hours remaining for independent MM market discovery",
+    )
+    mm_independent_max_markets: int = Field(
+        20,
+        gt=0,
+        description="Maximum independent short-horizon markets to feed into MM per cycle",
+    )
+    mm_independent_fetch_limit: int = Field(
+        300,
+        ge=50,
+        le=1000,
+        description="Number of markets to fetch for independent MM discovery",
+    )
     mm_min_market_volume_24h_usd: float = Field(
         250_000.0,
         ge=0.0,
@@ -186,6 +211,25 @@ class Settings(BaseSettings):
     max_effective_spread: float = Field(0.06, ge=0.01, le=0.50, description="Block MM when book spread > this value")
     toxicity_lookback: int = Field(5, ge=1, description="Number of recent fills to evaluate for toxicity")
 
+    # ── Dump+Hedge 15m strategy (paper-first) ─────────────────────────────────
+    dh15m_enabled: bool = Field(False, description="Enable dump+hedge 15m strategy loop")
+    dh15m_cycle_seconds: int = Field(2, gt=0, description="Tick interval for dump+hedge scanner")
+    dh15m_fetch_limit: int = Field(300, ge=50, le=1000, description="Markets fetched per tick for dump+hedge")
+    dh15m_assets: str = Field("btc,eth,sol,xrp", description="Comma-separated allowed assets for dump+hedge")
+    dh15m_move_threshold: float = Field(0.12, ge=0.01, le=0.80, description="Min fractional ask drop to trigger leg1")
+    dh15m_window_seconds: int = Field(90, ge=10, le=1800, description="Lookback window for dump detection")
+    dh15m_sum_target: float = Field(0.95, ge=0.20, le=1.80, description="Target max leg1+leg2 ask sum")
+    dh15m_shares: float = Field(25.0, gt=0.0, description="Paper shares per leg in dump+hedge")
+    dh15m_cost_buffer_per_pair: float = Field(
+        0.01,
+        ge=0.0,
+        le=0.20,
+        description="Approximate all-in costs per paired cycle (fees+slippage) used for net EV estimation",
+    )
+    dh15m_stop_hedge_wait_seconds: int = Field(120, ge=10, le=7200, description="Wait time before stop-hedge path")
+    dh15m_min_minutes_to_end: float = Field(5.0, ge=0.0, le=120.0, description="Min minutes to expiry to consider market")
+    dh15m_max_minutes_to_end: float = Field(20.0, ge=1.0, le=720.0, description="Max minutes to expiry to consider market")
+
     # ── Bot cadence ───────────────────────────────────────────────────────────
     cycle_interval_seconds: int = Field(300, gt=0, description="Seconds between evaluation cycles")
     dry_run: bool = Field(True, description="When True, evaluate only — no real orders are placed")
@@ -249,6 +293,10 @@ class Settings(BaseSettings):
     def _ensure_data_dir(self) -> "Settings":
         if self.mm_min_entry_price >= self.mm_max_entry_price:
             raise ValueError("mm_min_entry_price must be lower than mm_max_entry_price")
+        if self.mm_short_horizon_min_minutes >= self.mm_short_horizon_max_hours * 60:
+            raise ValueError("mm_short_horizon_min_minutes must be lower than mm_short_horizon_max_hours * 60")
+        if self.dh15m_min_minutes_to_end >= self.dh15m_max_minutes_to_end:
+            raise ValueError("dh15m_min_minutes_to_end must be lower than dh15m_max_minutes_to_end")
         if self.mm_blacklist_lookback_trades < self.mm_blacklist_min_trades:
             raise ValueError("mm_blacklist_lookback_trades must be >= mm_blacklist_min_trades")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +307,10 @@ class Settings(BaseSettings):
     @property
     def rpc_url_list(self) -> list[str]:
         return [u.strip() for u in self.polygon_rpc_urls.split(",") if u.strip()]
+
+    @property
+    def dh15m_assets_set(self) -> set[str]:
+        return {a.strip().lower() for a in self.dh15m_assets.split(",") if a.strip()}
 
     @property
     def confidence_rank(self) -> dict[str, int]:

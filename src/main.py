@@ -9,8 +9,10 @@ Startup sequence
 4.  Probe Polygon RPC endpoints and establish AsyncWeb3.
 5.  Initialise the Polymarket CLOB client and derive API credentials.
 6.  Start the ChromaDB / LlamaIndex RAG engine.
-7.  Enter the main evaluation loop (every CYCLE_INTERVAL_SECONDS).
-8.  On SIGINT/SIGTERM: drain in-flight tasks, close connections, exit cleanly.
+7.  Start the WebSocket order book feed (event-driven, replaces HTTP polling).
+8.  Start the Brain analysis engine and Trigger execution engine.
+9.  Enter the (now lightweight) LLM discovery loop for market selection.
+10. On SIGINT/SIGTERM: drain in-flight tasks, close connections, exit cleanly.
 
 Run
 ---
@@ -27,18 +29,32 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# ── uvloop: faster event loop (2-4× I/O throughput on Linux/macOS) ──────────
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass  # fallback to standard asyncio — install uvloop for production
+
 # Ensure the repo root is on the path so `src.*` imports resolve correctly
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import logging.handlers
 
 from src.ai.rag_engine import RagEngine
+from src.core.brain import Brain
 from src.core.config import get_settings
 from src.core.database import Database
 from src.core.notifier import notifier
 from src.core.provider import PolyProvider
 from src.core.security import get_private_key
+from src.polymarket.book_cache import BookCache
 from src.polymarket.clob_client import AsyncClobClient
+from src.polymarket.fill_cache import FillCache
+from src.polymarket.models import Market
+from src.polymarket.user_ws_client import UserWsClient, make_api_creds_from_clob
+from src.polymarket.ws_client import WsClient
+from src.strategy.ws_stat_arb import WsStatArbEngine
 from src.strategy.llm_evaluator import LLMEvaluator
 from src.strategy.market_maker import MarketMaker
 
@@ -62,6 +78,10 @@ def _setup_logging(cfg) -> None:
             ),
         ],
     )
+    # Silence chatty third-party loggers — only show warnings and above
+    for _noisy in ("httpx", "httpcore", "websockets", "websockets.client",
+                   "asyncio", "chromadb", "chromadb.telemetry"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger("polymarket_bot")
 
@@ -107,11 +127,61 @@ async def _get_bankroll(provider, cfg) -> float:
     return max(bankroll, 1.0)
 
 
-async def _slow_loop(evaluator: LLMEvaluator, maker: MarketMaker, provider, cfg) -> None:
+def _select_independent_mm_markets(markets: dict[str, Market], cfg) -> dict[str, Market]:
+    """Select short-horizon markets for MM without relying on LLM approval."""
+    if not cfg.mm_independent_discovery_enabled:
+        return {}
+
+    min_minutes = float(cfg.mm_short_horizon_min_minutes)
+    max_minutes = float(cfg.mm_short_horizon_max_hours) * 60.0
+
+    shortlisted: list[Market] = []
+    for market in markets.values():
+        if not market.active or market.closed or market.archived:
+            continue
+        if market.yes_token is None:
+            continue
+        if market.yes_price is None or not (0.03 < market.yes_price < 0.97):
+            continue
+        if market.volume_24hr < cfg.mm_min_market_volume_24h_usd:
+            continue
+        if market.liquidity < cfg.mm_min_market_liquidity_usd:
+            continue
+
+        days_to_end = market.days_to_end
+        if days_to_end is None:
+            continue
+        minutes_to_end = days_to_end * 24.0 * 60.0
+        if minutes_to_end < min_minutes or minutes_to_end > max_minutes:
+            continue
+
+        shortlisted.append(market)
+
+    shortlisted.sort(
+        key=lambda m: (m.volume_24hr, m.liquidity),
+        reverse=True,
+    )
+
+    limited = shortlisted[: cfg.mm_independent_max_markets]
+    return {m.condition_id: m for m in limited}
+
+
+async def _slow_loop(
+    evaluator: LLMEvaluator,
+    maker: MarketMaker,
+    brain: Brain,
+    provider,
+    clob: AsyncClobClient,
+    ws: WsClient,
+    user_ws,          # UserWsClient | None
+    cfg,
+) -> None:
     """LLM evaluation cycle (every CYCLE_INTERVAL_SECONDS).
 
     Discovers markets, runs LLM analysis, and feeds approved markets
-    into the MarketMaker for spread capture.
+    into the MarketMaker + Brain for spread capture.
+    Also keeps both WebSocket channels (book + user fills) in sync
+    with the current approved market set.
     """
     cycle = 0
     while not _shutdown_event.is_set():
@@ -123,11 +193,41 @@ async def _slow_loop(evaluator: LLMEvaluator, maker: MarketMaker, provider, cfg)
             summary = await evaluator.run_cycle(bankroll=bankroll)
             log.info("LLM cycle summary: %s", summary)
 
-            # Feed approved markets to the market maker
+            # Feed approved markets to the market maker and brain
             approved = evaluator.get_approved_markets()
-            if approved:
-                maker.update_active_markets(approved)
-                log.info("MM active markets updated: %d", len(approved))
+            if cfg.mm_enabled:
+                raw_markets = await clob.get_markets(limit=cfg.mm_independent_fetch_limit)
+                discovered = _select_independent_mm_markets(
+                    {m.condition_id: m for m in raw_markets},
+                    cfg,
+                )
+                mm_pool = dict(approved)
+                mm_pool.update(discovered)
+                maker.update_active_markets(mm_pool)
+                brain.update_approved_markets(mm_pool)
+
+                # Update order-book WS subscriptions (public channel)
+                token_ids = [
+                    m.yes_token.token_id
+                    for m in mm_pool.values()
+                    if m.yes_token
+                ]
+                await ws.subscribe(token_ids)
+
+                # Update user-fill WS subscriptions (authenticated channel)
+                if user_ws is not None:
+                    condition_ids = list(mm_pool.keys())
+                    await user_ws.subscribe(condition_ids)
+
+                log.info(
+                    "MM market pool updated: llm=%d short_horizon=%d total=%d "
+                    "(book_tokens=%d fill_markets=%d)",
+                    len(approved),
+                    len(discovered),
+                    len(mm_pool),
+                    len(token_ids),
+                    len(mm_pool) if user_ws else 0,
+                )
 
         except Exception as exc:
             log.exception("Unexpected error in LLM cycle %d: %s", cycle, exc)
@@ -142,10 +242,11 @@ async def _slow_loop(evaluator: LLMEvaluator, maker: MarketMaker, provider, cfg)
 
 
 async def _fast_loop(maker: MarketMaker, db: Database, cfg) -> None:
-    """Market-making fast loop (every MM_CYCLE_SECONDS).
+    """Market-making fast loop — now wakes on signal queue, not a fixed timer.
 
-    Manages GTC order lifecycle: post buys, detect fills, post sells,
-    capture spread profit, and enforce circuit breakers.
+    Reads ExecutionSignal / CancelSignal objects from the Brain's queue
+    and dispatches them immediately.  Falls back to a 1s timeout poll so
+    time-based checks (stale orders, trailing exit) still run.
     """
     tick = 0
     while not _shutdown_event.is_set():
@@ -163,6 +264,8 @@ async def _fast_loop(maker: MarketMaker, db: Database, cfg) -> None:
         except Exception as exc:
             log.error("MM tick %d error: %s", tick, exc)
 
+        # Use a short timeout so the loop stays responsive to shutdown
+        # The event-driven part (Brain signals) is handled via the signal_queue
         try:
             await asyncio.wait_for(
                 _shutdown_event.wait(),
@@ -172,15 +275,34 @@ async def _fast_loop(maker: MarketMaker, db: Database, cfg) -> None:
             pass
 
 
+
 # ── Health check server ───────────────────────────────────────────────────────
 
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Respuestas HTTP muy simples para el Docker healthcheck o balanceadores."""
     try:
+        # Read and discard request line + headers to avoid abrupt socket resets
+        # on some clients when closing a connection with unread data.
+        try:
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=0.2)
+        except Exception:
+            pass
+
         if _shutdown_event.is_set():
-            response = b"HTTP/1.1 503 Service Unavailable\r\n\r\nDOWN\n"
+            status = b"503 Service Unavailable"
+            body = b"DOWN\n"
         else:
-            response = b"HTTP/1.1 200 OK\r\n\r\nOK\n"
+            status = b"200 OK"
+            body = b"OK\n"
+
+        headers = (
+            b"HTTP/1.1 " + status + b"\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        )
+        response = headers + body
         writer.write(response)
         await writer.drain()
     except Exception:
@@ -298,8 +420,39 @@ async def main() -> None:
     log.info("RAG engine ready — %d documents in index.", doc_count)
 
     # ── 7. Strategy engines ─────────────────────────────────────────────────────
-    evaluator = LLMEvaluator(clob=clob, rag=rag, db=db, settings=cfg)
-    maker = MarketMaker(clob=clob, db=db, settings=cfg)
+    signal_queue = asyncio.Queue(maxsize=500)
+    book_cache   = BookCache(max_age_seconds=5.0)
+    fill_cache   = FillCache(max_age_seconds=300.0)
+    ws_client    = WsClient(book_cache=book_cache)
+
+    # Build L2 API credentials for the user WebSocket (requires live mode)
+    user_api_creds = make_api_creds_from_clob(clob)
+    user_ws = UserWsClient(
+        fill_cache=fill_cache,
+        api_creds=user_api_creds,
+    ) if (user_api_creds and not cfg.dry_run) else None
+
+    if user_ws is None:
+        log.info(
+            "UserWsClient: disabled (dry_run=%s, creds=%s) — fill detection falls back to HTTP",
+            cfg.dry_run, "missing" if user_api_creds is None else "OK",
+        )
+
+    evaluator    = LLMEvaluator(clob=clob, rag=rag, db=db, settings=cfg)
+    maker        = MarketMaker(
+        clob=clob,
+        db=db,
+        settings=cfg,
+        fill_cache=fill_cache if user_ws else None,
+        book_cache=book_cache,
+    )
+    stat_arber   = WsStatArbEngine(cfg=cfg, clob=clob, ws=ws_client, cache=book_cache, db=db)
+    brain        = Brain(
+        book_cache=book_cache,
+        signal_queue=signal_queue,
+        db=db,
+        settings=cfg,
+    )
 
     # ── 8. Dual loop ─────────────────────────────────────────────────────────
     if provider is None:
@@ -310,29 +463,53 @@ async def main() -> None:
         provider = _NoProvider()  # type: ignore[assignment]
 
     loops = [
-        _slow_loop(evaluator, maker, provider, cfg),
+        ws_client.stream(),                                          # public WS: order book
+        brain.run(),                                                 # event-driven analysis
+        _slow_loop(evaluator, maker, brain, provider, clob, ws_client, user_ws, cfg),
         _run_health_server(cfg.health_port),
     ]
+    if user_ws is not None:
+        loops.append(user_ws.stream())   # authenticated WS: fill/cancel events
     if cfg.mm_enabled:
         loops.append(_fast_loop(maker, db, cfg))
-        log.info("Starting dual loops: LLM (every %ds) + MM (every %ds)",
-                 cfg.cycle_interval_seconds, cfg.mm_cycle_seconds)
+        log.info(
+            "Starting: WsClient + Brain + LLM (every %ds) + MM (every %ds)",
+            cfg.cycle_interval_seconds, cfg.mm_cycle_seconds,
+        )
     else:
-        log.info("Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
-                 cfg.cycle_interval_seconds)
+        log.info(
+            "Starting: WsClient + Brain + LLM (every %ds) — MM disabled",
+            cfg.cycle_interval_seconds,
+        )
+
+    if cfg.dh15m_enabled:
+        await stat_arber.initialize_clusters()
+        loops.append(stat_arber.run())
+        log.info(
+            "WS StatArb Engine enabled (Cross-Market & Spread Arb): sum_target=%.3f",
+            cfg.dh15m_sum_target,
+        )
 
     try:
-        await notifier.send_message(f"Bot Iniciado | Dry Run: {cfg.dry_run} | MM: {cfg.mm_enabled}")
+        ws_mode = "WS(book+fills)" if user_ws else "WS(book-only)"
+        await notifier.send_message(
+            f"Bot Iniciado | Dry Run: {cfg.dry_run} | MM: {cfg.mm_enabled} | {ws_mode}"
+        )
         await asyncio.gather(*loops)
     finally:
         log.info("Shutting down…")
         await notifier.send_message("🛑 <b>Polymarket Bot Apagado</b>")
+        await ws_client.stop()
+        if user_ws is not None:
+            await user_ws.stop()
+        await brain.stop()
         await maker.cancel_all()
         await clob.close()
         await db.close()
         if hasattr(provider, "close"):
             await provider.close()  # type: ignore[union-attr]
         log.info("Bot stopped cleanly.")
+
 
 
 if __name__ == "__main__":

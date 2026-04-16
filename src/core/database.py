@@ -117,11 +117,44 @@ CREATE TABLE IF NOT EXISTS mm_fills (
     filled_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS mm_rejections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id       TEXT    NOT NULL,
+    token_id        TEXT,
+    question        TEXT,
+    reason_code     TEXT    NOT NULL,
+    detail          TEXT,
+    slot_state      TEXT,
+    created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS dump_hedge_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id        TEXT    NOT NULL,
+    market_id       TEXT    NOT NULL,
+    question        TEXT,
+    asset           TEXT,
+    phase           TEXT    NOT NULL,   -- LEG1 | LEG2 | STOP_HEDGE
+    leg1_side       TEXT,
+    leg1_price      REAL,
+    leg2_price      REAL,
+    sum_price       REAL,
+    shares          REAL,
+    status          TEXT    NOT NULL,
+    detail_json     TEXT,
+    created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_market      ON orders(market_id);
 CREATE INDEX IF NOT EXISTS idx_positions_market   ON positions(market_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_mkt    ON evaluations(market_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_mm_rounds_market   ON mm_rounds(market_id, status);
 CREATE INDEX IF NOT EXISTS idx_mm_fills_market    ON mm_fills(market_id, filled_at);
+CREATE INDEX IF NOT EXISTS idx_mm_rej_reason      ON mm_rejections(reason_code, created_at);
+CREATE INDEX IF NOT EXISTS idx_mm_rej_market      ON mm_rejections(market_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_dh_cycle           ON dump_hedge_events(cycle_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_dh_asset           ON dump_hedge_events(asset, created_at);
+CREATE INDEX IF NOT EXISTS idx_dh_phase           ON dump_hedge_events(phase, created_at);
 CREATE INDEX IF NOT EXISTS idx_calibration_market ON llm_calibration(market_id);
 """
 
@@ -656,3 +689,126 @@ class Database:
             return 0.0
         toxic = sum(1 for f in fills if (f.get("adverse_move") or 0) >= 0.005)
         return toxic / len(fills)
+
+    # ── MM Rejections (entry diagnostics) ───────────────────────────────
+
+    async def insert_mm_rejection(
+        self,
+        *,
+        market_id: str,
+        token_id: str | None,
+        question: str,
+        reason_code: str,
+        detail: str = "",
+        slot_state: str = "IDLE",
+    ) -> int:
+        async with self._tx() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO mm_rejections
+                    (market_id, token_id, question, reason_code, detail, slot_state)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (market_id, token_id, question, reason_code, detail, slot_state),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    async def get_mm_rejections(
+        self,
+        *,
+        since_hours: int = 24,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT * FROM mm_rejections
+            WHERE created_at >= datetime('now', ? || ' hours')
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (f"-{since_hours}", limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_mm_rejection_summary(
+        self,
+        *,
+        since_hours: int = 24,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT reason_code, COUNT(*) AS count
+            FROM mm_rejections
+            WHERE created_at >= datetime('now', ? || ' hours')
+            GROUP BY reason_code
+            ORDER BY count DESC, reason_code ASC
+            """,
+            (f"-{since_hours}",),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Dump+Hedge events (paper A/B analytics) ─────────────────────────
+
+    async def insert_dump_hedge_event(
+        self,
+        *,
+        cycle_id: str,
+        market_id: str,
+        question: str,
+        asset: str,
+        phase: str,
+        leg1_side: str | None,
+        leg1_price: float | None,
+        leg2_price: float | None,
+        sum_price: float | None,
+        shares: float,
+        status: str,
+        detail_json: str = "",
+    ) -> int:
+        async with self._tx() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO dump_hedge_events
+                    (cycle_id, market_id, question, asset, phase, leg1_side,
+                     leg1_price, leg2_price, sum_price, shares, status, detail_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cycle_id,
+                    market_id,
+                    question,
+                    asset,
+                    phase,
+                    leg1_side,
+                    leg1_price,
+                    leg2_price,
+                    sum_price,
+                    shares,
+                    status,
+                    detail_json,
+                ),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    async def get_dump_hedge_recent(
+        self,
+        *,
+        since_hours: int = 24,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT * FROM dump_hedge_events
+            WHERE created_at >= datetime('now', ? || ' hours')
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (f"-{since_hours}", limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]

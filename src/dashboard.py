@@ -13,6 +13,7 @@ Connects read-only to data/bot_state.db and displays four tabs:
 from __future__ import annotations
 
 import sqlite3
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -23,6 +24,9 @@ import streamlit as st
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).parent.parent / "data" / "bot_state.db"
+ENV_PATH = Path(__file__).parent.parent / ".env"
+
+_RE_ENV_FLOAT = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.MULTILINE)
 
 st.set_page_config(
     page_title="Polymarket Intelligence",
@@ -37,6 +41,15 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@st.cache_data(ttl=30)
+def load_dh15m_cost_buffer() -> float:
+    if not ENV_PATH.exists():
+        return 0.01
+    text = ENV_PATH.read_text(encoding="utf-8", errors="ignore")
+    values = {m.group(1): float(m.group(2)) for m in _RE_ENV_FLOAT.finditer(text)}
+    return float(values.get("DH15M_COST_BUFFER_PER_PAIR", 0.01))
 
 
 @st.cache_data(ttl=30)
@@ -110,6 +123,43 @@ def load_mm_rounds() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def load_mm_rejections() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    conn = _connect()
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM mm_rejections ORDER BY created_at DESC", conn
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=30)
+def load_dump_hedge_events() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    conn = _connect()
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM dump_hedge_events ORDER BY created_at DESC", conn
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.title("📈 Polymarket Intel")
@@ -132,6 +182,9 @@ evals  = load_evaluations()
 orders = load_orders()
 positions = load_positions()
 mm_rounds = load_mm_rounds()
+mm_rejections = load_mm_rejections()
+dh_events = load_dump_hedge_events()
+dh_cost_buffer = load_dh15m_cost_buffer()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
@@ -400,7 +453,7 @@ with tab4:
     st.header("Market Making Performance")
 
     if mm_rounds.empty:
-        st.info("No market-making data yet.  Start the bot with the MM loop enabled.")
+        st.info("No market-making rounds yet.  Start the bot with the MM loop enabled.")
     else:
         # ── Filter today's closed rounds ──────────────────────────────────────
         today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
@@ -481,6 +534,133 @@ with tab4:
         # ── Raw data expander ─────────────────────────────────────────────────
         with st.expander("All MM rounds (raw data)"):
             st.dataframe(mm_rounds.tail(200), use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("MM Rejection Diagnostics (last 24h)")
+
+    if mm_rejections.empty:
+        st.info("No MM rejections logged yet.")
+    else:
+        cutoff_utc = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
+        recent_rej = mm_rejections[
+            mm_rejections["created_at"] >= cutoff_utc
+        ].copy()
+
+        if recent_rej.empty:
+            st.info("No MM rejections in the last 24h.")
+        else:
+            reason_counts = (
+                recent_rej["reason_code"]
+                .value_counts()
+                .rename_axis("reason_code")
+                .reset_index(name="count")
+            )
+
+            fig_rej = px.bar(
+                reason_counts,
+                x="reason_code",
+                y="count",
+                title="Rejections by Reason (24h)",
+                labels={"reason_code": "Reason", "count": "Count"},
+                color="count",
+                color_continuous_scale=["#95a5a6", "#e67e22", "#e74c3c"],
+            )
+            fig_rej.update_layout(height=320, coloraxis_showscale=False)
+            st.plotly_chart(fig_rej, use_container_width=True)
+
+            display_cols = [
+                "created_at", "reason_code", "question", "slot_state", "detail",
+            ]
+            display_cols = [c for c in display_cols if c in recent_rej.columns]
+            st.dataframe(recent_rej[display_cols].head(200), use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("HFT StatArb Events (Cross-Market & Spread, last 24h)")
+
+    if dh_events.empty:
+        st.info("No StatArb events logged yet. Enable DH15M to monitor.")
+    else:
+        cutoff_utc = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
+        recent_dh = dh_events[dh_events["created_at"] >= cutoff_utc].copy()
+
+        if recent_dh.empty:
+            st.info("No StatArb events in the last 24h.")
+        else:
+            cycles = recent_dh["cycle_id"].nunique() if "cycle_id" in recent_dh.columns else 0
+            hedged = int((recent_dh["status"] == "HEDGED").sum()) if "status" in recent_dh.columns else 0
+            stop_hedged = int((recent_dh["status"] == "STOP_HEDGED").sum()) if "status" in recent_dh.columns else 0
+            hedge_rate = (hedged / cycles * 100) if cycles else 0.0
+            stop_rate = (stop_hedged / cycles * 100) if cycles else 0.0
+            avg_sum = (
+                float(recent_dh["sum_price"].dropna().mean())
+                if "sum_price" in recent_dh.columns and recent_dh["sum_price"].notna().any()
+                else 0.0
+            )
+
+            settled = recent_dh[
+                recent_dh["status"].isin(["HEDGED", "STOP_HEDGED"]) & recent_dh["sum_price"].notna()
+            ].copy() if "status" in recent_dh.columns and "sum_price" in recent_dh.columns else pd.DataFrame()
+
+            if not settled.empty:
+                settled["gross_ev"] = 1.0 - settled["sum_price"]
+                settled["net_ev"] = settled["gross_ev"] - dh_cost_buffer
+                avg_gross_ev = float(settled["gross_ev"].mean())
+                avg_net_ev = float(settled["net_ev"].mean())
+                est_net_total = float(settled["net_ev"].sum())
+            else:
+                avg_gross_ev = 0.0
+                avg_net_ev = 0.0
+                est_net_total = 0.0
+
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Cycles", f"{cycles:,}")
+            c2.metric("Hedge Hit Rate", f"{hedge_rate:.1f}%")
+            c3.metric("Stop-Hedge Rate", f"{stop_rate:.1f}%")
+            c4.metric("Avg Sum Price", f"{avg_sum:.4f}")
+            c5.metric("Avg Gross EV/trade", f"{avg_gross_ev:+.4f}")
+            c6.metric("Avg Net EV/trade", f"{avg_net_ev:+.4f}")
+
+            st.caption(
+                f"Net EV uses DH15M_COST_BUFFER_PER_PAIR={dh_cost_buffer:.4f}. "
+                f"Estimated net EV total (24h settled): {est_net_total:+.4f}"
+            )
+
+            phase_counts = (
+                recent_dh["phase"].value_counts().rename_axis("phase").reset_index(name="count")
+                if "phase" in recent_dh.columns
+                else pd.DataFrame(columns=["phase", "count"])
+            )
+            if not phase_counts.empty:
+                fig_phase = px.bar(
+                    phase_counts,
+                    x="phase",
+                    y="count",
+                    title="DH15M Events by Phase (24h)",
+                    labels={"phase": "Phase", "count": "Count"},
+                    color="count",
+                    color_continuous_scale=["#95a5a6", "#7f8c8d", "#2c3e50"],
+                )
+                fig_phase.update_layout(height=300, coloraxis_showscale=False)
+                st.plotly_chart(fig_phase, use_container_width=True)
+
+            if "sum_price" in recent_dh.columns and recent_dh["sum_price"].notna().any():
+                fig_sum = px.histogram(
+                    recent_dh.dropna(subset=["sum_price"]),
+                    x="sum_price",
+                    nbins=30,
+                    title="DH15M Sum Price Distribution (24h)",
+                    labels={"sum_price": "Leg1 + Leg2"},
+                    color_discrete_sequence=["#34495e"],
+                )
+                fig_sum.update_layout(height=300)
+                st.plotly_chart(fig_sum, use_container_width=True)
+
+            display_cols = [
+                "created_at", "asset", "phase", "status", "leg1_side",
+                "leg1_price", "leg2_price", "sum_price", "shares", "question",
+            ]
+            display_cols = [c for c in display_cols if c in recent_dh.columns]
+            st.dataframe(recent_dh[display_cols].head(200), use_container_width=True)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 

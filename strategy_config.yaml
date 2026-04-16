@@ -7,6 +7,14 @@ general:
   pool_timeframe_minutes: 15
   no_trade_last_minutes_before_expiry: 3
 
+websocket:
+  endpoint: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  reconnect_base_delay_s: 1.0
+  reconnect_max_delay_s: 60.0
+  ping_interval_s: 20.0
+  ping_timeout_s: 10.0
+  max_book_age_seconds: 5.0   # treat snapshot as stale if older than this
+
 universe:
   enabled_assets: ["BTC", "ETH", "SOL", "BNB", "XRP"]
   max_assets_per_round: 2
@@ -64,10 +72,12 @@ market_filters:
     XRP: 1.5
 
 cost_model:
-  taker_fee_pct: 0.20      # ejemplo, ajusta a tu caso real
-  maker_fee_pct: 0.00      # si aplica
-  use_taker_by_default: true
-  extra_buffer_pct: 0.15   # colchón por latencia/ejecución
+  taker_fee_bps: 20          # Polymarket taker fee = 0.20%
+  maker_fee_bps: 0           # passive orders earn rebate instead
+  gas_gwei_budget: 50.0      # Polygon gas price budget in Gwei
+  matic_price_usd: 0.80      # MATIC/USD for gas cost estimate (update periodically)
+  extra_slippage_buffer: 0.001   # 0.1% latency/requeue buffer
+  min_net_edge_usd: 0.001    # reject signal if net_edge below this threshold
 
 entry_rules:
   # edge_net = (p_model - p_market) - total_cost
@@ -95,7 +105,11 @@ risk:
   risk_per_trade_pct: 0.50
   max_total_exposure_pct: 2.5
   max_exposure_per_asset_pct: 1.0
-  max_daily_drawdown_pct: 3.0
+  max_daily_drawdown_pct: 1.5        # tighter: was 3.0 → 1.5%
+  obi_emergency_threshold: -0.30     # kill orders instantly below this OBI
+  spread_volatility_multiplier: 3.0  # pull order if spread 3× wider than entry
+  pre_resolution_guard_minutes: 3.0  # tighten OBI in last N min before resolution
+  pre_resolution_obi_threshold: -0.10
   consecutive_losses_cooldown:
     enabled: true
     losses: 2

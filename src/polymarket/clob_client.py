@@ -179,6 +179,51 @@ class AsyncClobClient:
                 markets.append(m)
         return markets
 
+    async def get_market_clusters(
+        self,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch active markets and group them into clusters of related strikes.
+        Returns a list of dicts: {"base_question": str, "end_date_iso": str, "markets": list[(strike, Market)]}
+        Only returns clusters with >= 2 strikes.
+        """
+        import re
+        from collections import defaultdict
+        
+        markets = await self.get_markets(limit=limit)
+        clusters = defaultdict(list)
+        
+        for m in markets:
+            if not m.active or m.closed or m.archived: continue
+            q = m.question or ""
+            # Buscar valor de strike en dolares (ej. $65,000 o $1.25)
+            m_dollars = re.search(r'\$([0-9,\.]+)', q)
+            if m_dollars:
+                strike_str = m_dollars.group(1).replace(',', '')
+                try:
+                    strike = float(strike_str)
+                except ValueError:
+                    continue
+                # base_q es la pregunta sin el strike, ej "Will BTC be above $XXX at..."
+                base_q = q.replace(f'${m_dollars.group(1)}', '$XXX')
+                
+                # Agrupar por la base_q y dias_restantes (para asegurar misma fecha)
+                end_date_key = round(m.days_to_end or 0, 3)
+                clusters[(base_q, end_date_key)].append((strike, m))
+                
+        valid_clusters = []
+        for (base_q, _), strikes in clusters.items():
+            if len(strikes) >= 2:
+                # Ordenar de menor strike a mayor strike
+                sorted_strikes = sorted(strikes, key=lambda x: x[0])
+                valid_clusters.append({
+                    "base_question": base_q,
+                    "markets": sorted_strikes
+                })
+                
+        return valid_clusters
+
     async def get_market(self, condition_id: str) -> Optional[Market]:
         """Fetch a single market by condition ID (Gamma API)."""
         try:
