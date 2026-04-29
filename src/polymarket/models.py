@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -121,8 +121,7 @@ class Market(BaseModel):
         except Exception:
             return None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # ── Order Book ────────────────────────────────────────────────────────────────
