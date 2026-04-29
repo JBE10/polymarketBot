@@ -23,19 +23,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Optional
 
 import httpx
 
-from src.ai.market_context import ShortTermMarketContext
+from src.ai.market_context import CryptoSignal, ShortTermMarketContext
 from src.ai.prompts import (
     EVALUATE_MARKET_SCHEMA,
-    SHORT_TERM_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_evaluation_prompt,
     build_rag_query,
-    build_short_term_evaluation_prompt,
 )
 from src.ai.rag_engine import RagEngine
 from src.ai.web_search import CryptoPriceFetcher
@@ -418,20 +417,12 @@ class LLMEvaluator:
         else:
             log.info("[ST] No microstructure data for '%s'", market.question[:40])
 
-        # ── Build short-term prompt ─────────────────────────────────────────
-        user_msg = build_short_term_evaluation_prompt(
-            question=market.question,
-            description=market.description,
-            current_yes_price=yes_price,
+        return await self._run_short_term_math_and_act(
+            market=market,
+            yes_price=yes_price,
+            bankroll=bankroll,
             minutes_to_end=minutes,
             crypto_context=crypto_context,
-            volume_24h=market.volume_24hr,
-            liquidity=market.liquidity,
-        )
-
-        return await self._run_short_term_llm_and_act(
-            market, user_msg, yes_price, bankroll,
-            system_prompt=SHORT_TERM_SYSTEM_PROMPT,
         )
 
     # ── Shared LLM dispatch + decision + DB persist ───────────────────────────
@@ -618,6 +609,195 @@ class LLMEvaluator:
         if self._provider == "ollama":
             return await self._call_ollama(user_msg, system_prompt)
         return await self._call_gemini(user_msg, system_prompt)
+
+    async def _run_short_term_math_and_act(
+        self,
+        market: Market,
+        yes_price: float,
+        bankroll: float,
+        minutes_to_end: float | None,
+        crypto_context: str = "",
+    ) -> dict:
+        """Short-term decision path with no LLM calls."""
+        no_price = market.no_price
+        if no_price is None:
+            return {"action": Action.SKIP, "skip_reason": "NO price unavailable"}
+
+        signal = await self._get_primary_short_term_signal(market)
+        yes_probability, signal_score, direction = self._estimate_short_term_yes_probability(
+            market=market,
+            signal=signal,
+        )
+        confidence = self._math_confidence(signal_score, signal)
+        evaluation = MarketEvaluation(
+            probability_estimate=yes_probability,
+            confidence=confidence,
+            reasoning=(
+                "Math-only short-term estimate. "
+                f"direction={direction}; signal_score={signal_score:+.3f}; "
+                f"minutes_to_end={minutes_to_end if minutes_to_end is not None else 'n/a'}."
+            ),
+            key_factors=self._math_key_factors(signal, crypto_context),
+            should_skip=confidence == Confidence.LOW,
+            skip_reason="Weak mathematical signal" if confidence == Confidence.LOW else "",
+        )
+
+        min_ev = self._cfg.short_term_min_ev_threshold or self._cfg.min_ev_threshold
+        choice = choose_binary_side(
+            yes_probability=evaluation.probability_estimate,
+            yes_price=yes_price,
+            no_price=no_price,
+            bankroll=bankroll,
+            kelly_fraction=self._cfg.kelly_fraction,
+            max_position_usd=self._cfg.max_position_usd,
+            min_ev_threshold=min_ev,
+            use_monte_carlo=self._cfg.short_term_use_monte_carlo,
+            mc_samples=self._cfg.short_term_mc_samples,
+            mc_seed=self._cfg.short_term_mc_seed,
+            mc_ev_tolerance=self._cfg.short_term_mc_ev_tolerance,
+        )
+        action = self._decide_short_term(evaluation, choice, min_ev)
+        selected_kelly = choice.kelly if choice else compute_kelly(
+            prob=evaluation.probability_estimate,
+            entry_price=yes_price,
+            bankroll=bankroll,
+            kelly_fraction=self._cfg.kelly_fraction,
+            max_position_usd=self._cfg.max_position_usd,
+        )
+        mc = choice.mc if choice else None
+        side = choice.outcome.value if choice else "NONE"
+
+        await self._db.insert_evaluation(
+            market_id=market.condition_id,
+            question=market.question,
+            market_price=yes_price,
+            estimated_prob=evaluation.probability_estimate,
+            expected_value=selected_kelly.ev_per_dollar,
+            kelly_fraction=selected_kelly.frac_kelly,
+            position_size_usd=selected_kelly.position_usd,
+            confidence=evaluation.confidence.value,
+            reasoning=evaluation.reasoning,
+            key_factors=json.dumps(evaluation.key_factors),
+            action=action.value,
+            skip_reason=evaluation.skip_reason if action == Action.BUY else (
+                evaluation.skip_reason or "No YES/NO side cleared math EV/Kelly gates"
+            ),
+            chosen_side=choice.outcome.value if choice else None,
+            side_price=choice.price if choice else None,
+            no_price=no_price,
+            mc_samples=mc.samples if mc else None,
+            mc_mean_edge=mc.mean_edge if mc else None,
+            mc_p05_edge=mc.p05_edge if mc else None,
+            mc_p95_edge=mc.p95_edge if mc else None,
+        )
+
+        await self._db.upsert_calibration(
+            market_id=market.condition_id,
+            question=market.question,
+            predicted_prob=evaluation.probability_estimate,
+            market_price=yes_price,
+            llm_provider="math",
+        )
+
+        log.info(
+            "[ST-MATH] %-50s YES=%.3f NO=%.3f pYES=%.3f side=%s EV=%+.3f conf=%s action=%s",
+            market.question[:50],
+            yes_price,
+            no_price,
+            evaluation.probability_estimate,
+            side,
+            selected_kelly.ev_per_dollar,
+            evaluation.confidence.value,
+            action.value,
+        )
+
+        return {
+            "action": action,
+            "evaluation": evaluation,
+            "kelly": selected_kelly,
+            "market": market,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "choice": choice,
+            "chosen_side": side,
+        }
+
+    async def _get_primary_short_term_signal(self, market: Market) -> CryptoSignal | None:
+        """Fetch the first crypto signal referenced by the market question."""
+        symbols = self._short_term_ctx._extract_symbols(  # noqa: SLF001 - local heuristic reuse
+            f"{market.question} {market.description}"
+        )
+        if not symbols:
+            return None
+        return await self._short_term_ctx.get_signal(symbols[0])
+
+    def _estimate_short_term_yes_probability(
+        self,
+        market: Market,
+        signal: CryptoSignal | None,
+    ) -> tuple[float, float, str]:
+        """Estimate P(YES) from price momentum and order-book pressure only."""
+        direction = self._question_direction(market)
+        if signal is None:
+            return self._cfg.short_term_math_base_prob, 0.0, direction
+
+        momentum_5m = math.tanh(signal.change_5m_pct / 0.50)
+        momentum_15m = math.tanh(signal.change_15m_pct / 0.80)
+        obi = max(-1.0, min(1.0, signal.obi))
+        raw = 0.50 * momentum_5m + 0.30 * momentum_15m + 0.20 * obi
+
+        # High volatility lowers confidence in the directional signal without
+        # flipping it. Short pools get noisy fast; no-trade is often best.
+        vol_penalty = min(abs(raw), max(0.0, signal.volatility_pct - 0.35) * 0.25)
+        adjusted = raw - math.copysign(vol_penalty, raw) if raw else 0.0
+        yes_signal = adjusted * (1.0 if direction == "UP" else -1.0)
+
+        prob = self._cfg.short_term_math_base_prob + (
+            yes_signal * self._cfg.short_term_math_signal_weight
+        )
+        prob = max(0.01, min(0.99, prob))
+        return round(prob, 6), round(yes_signal, 6), direction
+
+    @staticmethod
+    def _question_direction(market: Market) -> str:
+        """Infer whether YES means the asset goes up or down."""
+        text = f"{market.question} {market.description}".lower()
+        down_terms = (
+            "down", "below", "under", "lower", "fall", "falls", "drop", "drops",
+            "decrease", "decreases", "red candle",
+        )
+        if any(term in text for term in down_terms):
+            return "DOWN"
+        return "UP"
+
+    def _math_confidence(
+        self,
+        signal_score: float,
+        signal: CryptoSignal | None,
+    ) -> Confidence:
+        if signal is None:
+            return Confidence.LOW
+        strength = abs(signal_score)
+        if strength < 0.20:
+            return Confidence.LOW
+        if strength < 0.55:
+            return Confidence.MEDIUM
+        return Confidence.HIGH
+
+    @staticmethod
+    def _math_key_factors(signal: CryptoSignal | None, crypto_context: str) -> list[str]:
+        if signal is None:
+            return ["no live crypto signal available"]
+        factors = [
+            f"{signal.symbol} regime={signal.regime}",
+            f"5m momentum={signal.change_5m_pct:+.3f}%",
+            f"15m momentum={signal.change_15m_pct:+.3f}%",
+            f"order book imbalance={signal.obi:+.3f}",
+            f"15m volatility={signal.volatility_pct:.3f}%",
+        ]
+        if crypto_context:
+            factors.append("live context fetched")
+        return factors
 
     # ── Ollama (local) ────────────────────────────────────────────────────────
 

@@ -14,3 +14,11 @@ def test_monte_carlo_mean_converges_to_analytical_edge():
 
     assert result.mean_edge == pytest.approx(analytical_edge(0.62, 0.55), abs=0.01)
     assert result.win_rate == pytest.approx(0.62, abs=0.01)
+
+
+def test_expected_winrate_for_positive_edge_fixture():
+    """Controlled 58% probability fixture should produce about 58% wins."""
+    result = monte_carlo_edge(prob=0.58, entry_price=0.52, samples=25_000, seed=11)
+
+    assert result.win_rate == pytest.approx(0.58, abs=0.01)
+    assert result.mean_edge > 0.04

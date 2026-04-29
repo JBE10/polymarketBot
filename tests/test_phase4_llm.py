@@ -12,11 +12,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.ai.prompts import (
-    SYSTEM_PROMPT,
-    build_evaluation_prompt,
-    build_rag_query,
-)
+from src.ai.market_context import CryptoSignal
+from src.ai.prompts import SYSTEM_PROMPT, build_evaluation_prompt, build_rag_query
 from src.core.config import Settings
 from src.core.database import Database
 from src.polymarket.models import Confidence, Market, MarketEvaluation, MarketToken
@@ -198,6 +195,7 @@ class TestShortTermDecision:
         settings.short_term_mc_samples = 5_000
         settings.short_term_min_ev_threshold = 0.03
         settings.min_confidence = "LOW"
+        settings.short_term_math_signal_weight = 0.16
 
         evaluator = LLMEvaluator(
             clob=AsyncMock(),
@@ -205,12 +203,16 @@ class TestShortTermDecision:
             db=temp_db,
             settings=settings,
         )
-        evaluator._call_strategy_provider = AsyncMock(  # type: ignore[method-assign]
-            return_value=MarketEvaluation(
-                probability_estimate=0.35,
-                confidence=Confidence.HIGH,
-                reasoning="Short-term downside edge.",
-                key_factors=["bearish momentum"],
+        evaluator._short_term_ctx.get_signal = AsyncMock(  # type: ignore[method-assign]
+            return_value=CryptoSignal(
+                symbol="BTC",
+                price=100_000,
+                change_1m_pct=-0.40,
+                change_5m_pct=-0.80,
+                change_15m_pct=-1.20,
+                obi=-0.50,
+                volatility_pct=0.20,
+                regime="bearish",
             )
         )
 
@@ -229,12 +231,11 @@ class TestShortTermDecision:
             end_date_iso=(datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
         )
 
-        result = await evaluator._run_short_term_llm_and_act(
+        result = await evaluator._run_short_term_math_and_act(
             market=market,
-            user_msg="test",
             yes_price=0.52,
             bankroll=1_000,
-            system_prompt=SYSTEM_PROMPT,
+            minutes_to_end=15,
         )
 
         assert result["action"].value == "BUY"

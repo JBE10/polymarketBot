@@ -346,10 +346,11 @@ async def main() -> None:
 
         provider = _NoProvider()  # type: ignore[assignment]
 
-    loops = [
-        _slow_loop(evaluator, maker, provider, cfg),
-        _run_health_server(cfg.health_port),
-    ]
+    loops = [_run_health_server(cfg.health_port)]
+    if not cfg.short_term_only_mode:
+        loops.append(_slow_loop(evaluator, maker, provider, cfg))
+    else:
+        log.info("Short-term only mode enabled — standard LLM/RAG cycle disabled.")
     if cfg.mm_enabled:
         loops.append(_fast_loop(maker, db, cfg))
         log.info(
@@ -358,8 +359,7 @@ async def main() -> None:
         )
     else:
         log.info(
-            "Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
-            cfg.cycle_interval_seconds,
+            "MM disabled (set MM_ENABLED=true to activate)",
         )
 
     if cfg.enable_short_term_markets:

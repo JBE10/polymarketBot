@@ -156,6 +156,22 @@ class Settings(BaseSettings):
         le=0.10,
         description="Allowed MC mean EV shortfall vs analytical EV before skipping",
     )
+    short_term_math_base_prob: float = Field(
+        0.50,
+        ge=0.40,
+        le=0.60,
+        description="Neutral prior used by the mathematical short-term estimator",
+    )
+    short_term_math_signal_weight: float = Field(
+        0.08,
+        ge=0.0,
+        le=0.25,
+        description="Max probability adjustment from momentum/order-book signals",
+    )
+    short_term_only_mode: bool = Field(
+        True,
+        description="Skip slower LLM/RAG market scans and run only short-term math strategy",
+    )
 
     # ── Market-making (spread capture) ────────────────────────────────────────
     mm_enabled: bool = Field(False, description="Enable market-making fast loop (default OFF — directional-only is safer)")
