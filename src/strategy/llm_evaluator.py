@@ -337,7 +337,7 @@ class LLMEvaluator:
 
         # ── Crypto price context (replaces Tavily) ─────────────────────────
         web_context = ""
-        if self._crypto_fetcher.is_available:
+        if self._crypto_fetcher.is_available():
             search_query = f"{market.question} {market.description[:100]}".strip()
             web_context = await self._crypto_fetcher.search(search_query)
             if web_context:
