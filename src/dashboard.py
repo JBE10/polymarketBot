@@ -13,6 +13,7 @@ Connects read-only to data/bot_state.db and displays four tabs:
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -107,6 +108,13 @@ def load_mm_rounds() -> pd.DataFrame:
     for col in ("created_at", "closed_at"):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
+    if "realized_pnl" in df.columns:
+        rebate = df["rebate_est"] if "rebate_est" in df.columns else pd.Series(0.0, index=df.index)
+        computed_net = df["realized_pnl"].fillna(0) + rebate.fillna(0)
+        if "net_pnl" in df.columns:
+            df["net_pnl"] = df["net_pnl"].fillna(computed_net)
+        else:
+            df["net_pnl"] = computed_net
     return df
 
 
@@ -411,41 +419,42 @@ with tab4:
 
         # ── KPIs ──────────────────────────────────────────────────────────────
         today_rounds = len(today_closed)
-        today_wins = len(today_closed[today_closed["realized_pnl"] > 0]) if not today_closed.empty else 0
+        today_wins = len(today_closed[today_closed["net_pnl"] > 0]) if "net_pnl" in today_closed.columns and not today_closed.empty else 0
         today_winrate = (today_wins / today_rounds * 100) if today_rounds > 0 else 0.0
-        today_pnl = today_closed["realized_pnl"].sum() if not today_closed.empty else 0.0
+        today_net_pnl = today_closed["net_pnl"].sum() if "net_pnl" in today_closed.columns and not today_closed.empty else 0.0
+        today_gross_pnl = today_closed["realized_pnl"].sum() if "realized_pnl" in today_closed.columns and not today_closed.empty else 0.0
         today_rebate = today_closed["rebate_est"].sum() if "rebate_est" in today_closed.columns and not today_closed.empty else 0.0
 
         all_rounds = len(closed)
-        all_wins = len(closed[closed["realized_pnl"] > 0]) if not closed.empty else 0
+        all_wins = len(closed[closed["net_pnl"] > 0]) if "net_pnl" in closed.columns and not closed.empty else 0
         all_winrate = (all_wins / all_rounds * 100) if all_rounds > 0 else 0.0
-        all_pnl = closed["realized_pnl"].sum() if not closed.empty else 0.0
+        all_net_pnl = closed["net_pnl"].sum() if "net_pnl" in closed.columns and not closed.empty else 0.0
 
         st.subheader("Today")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Round-Trips", f"{today_rounds:,}")
         c2.metric("Win Rate", f"{today_winrate:.1f}%")
-        c3.metric("P&L", f"${today_pnl:+,.4f}",
-                  delta=f"{'▲' if today_pnl >= 0 else '▼'}")
-        c4.metric("Rebates (est)", f"${today_rebate:+,.4f}")
+        c3.metric("Net P&L", f"${today_net_pnl:+,.4f}",
+                  delta=f"{'▲' if today_net_pnl >= 0 else '▼'}")
+        c4.metric("Gross / Rebates", f"${today_gross_pnl:+,.4f} / ${today_rebate:+,.4f}")
 
         st.subheader("All-Time")
         c5, c6, c7 = st.columns(3)
         c5.metric("Total Rounds", f"{all_rounds:,}")
         c6.metric("All-Time Win Rate", f"{all_winrate:.1f}%")
-        c7.metric("Cumulative P&L", f"${all_pnl:+,.4f}")
+        c7.metric("Cumulative Net P&L", f"${all_net_pnl:+,.4f}")
 
         # ── Cumulative P&L chart ──────────────────────────────────────────────
-        if not closed.empty and "closed_at" in closed.columns:
+        if not closed.empty and "closed_at" in closed.columns and "net_pnl" in closed.columns:
             pnl_series = closed.sort_values("closed_at").copy()
-            pnl_series["cumulative_pnl"] = pnl_series["realized_pnl"].cumsum()
+            pnl_series["cumulative_net_pnl"] = pnl_series["net_pnl"].cumsum()
 
             fig_mm = px.line(
                 pnl_series,
                 x="closed_at",
-                y="cumulative_pnl",
-                title="Cumulative MM P&L Over Time",
-                labels={"closed_at": "Time", "cumulative_pnl": "Cumulative P&L ($)"},
+                y="cumulative_net_pnl",
+                title="Cumulative MM Net P&L Over Time",
+                labels={"closed_at": "Time", "cumulative_net_pnl": "Cumulative Net P&L ($)"},
             )
             fig_mm.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
             fig_mm.update_layout(height=400)
@@ -455,10 +464,10 @@ with tab4:
             fig_bar = px.bar(
                 pnl_series.tail(50),
                 x="closed_at",
-                y="realized_pnl",
-                title="Per-Round P&L (last 50 closed)",
-                labels={"realized_pnl": "P&L ($)", "closed_at": "Time"},
-                color="realized_pnl",
+                y="net_pnl",
+                title="Per-Round Net P&L (last 50 closed)",
+                labels={"net_pnl": "Net P&L ($)", "closed_at": "Time"},
+                color="net_pnl",
                 color_continuous_scale=["#e74c3c", "#95a5a6", "#2ecc71"],
                 color_continuous_midpoint=0,
             )
@@ -481,10 +490,6 @@ with tab4:
         # ── Raw data expander ─────────────────────────────────────────────────
         with st.expander("All MM rounds (raw data)"):
             st.dataframe(mm_rounds.tail(200), use_container_width=True)
-
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
-
-import time
 
 time.sleep(refresh_secs)
 st.rerun()

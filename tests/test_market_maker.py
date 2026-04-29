@@ -12,8 +12,10 @@ All CLOB calls are mocked — no network required.
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import aiosqlite
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from src.core.config import Settings
 from src.core.database import Database
@@ -21,13 +23,9 @@ from src.polymarket.models import (
     Market,
     MarketToken,
     OrderBook,
-    OrderResponse,
-    OrderStatus,
     PriceLevel,
-    Side,
 )
-from src.strategy.market_maker import MarketMaker, _MarketSlot
-
+from src.strategy.market_maker import MarketMaker
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -110,6 +108,18 @@ class TestProfitLifecycle:
 
         daily_pnl = await temp_db.get_daily_mm_pnl()
         assert daily_pnl > 0
+
+        async with aiosqlite.connect(temp_db.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT realized_pnl, rebate_est, net_pnl FROM mm_rounds WHERE status='CLOSED'"
+            ) as cur:
+                row = await cur.fetchone()
+
+        assert row is not None
+        expected_net = row["realized_pnl"] + row["rebate_est"]
+        assert row["net_pnl"] == pytest.approx(expected_net)
+        assert daily_pnl == pytest.approx(expected_net)
 
 
 # ── Stop-loss path ────────────────────────────────────────────────────────────

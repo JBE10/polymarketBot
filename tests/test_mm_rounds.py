@@ -19,7 +19,6 @@ import pytest
 
 from src.core.database import Database
 
-
 _MKT = "mkt_mm_test"
 _TOK = "tok_mm_test"
 _Q = "Will ETH hit $10k?"
@@ -113,6 +112,15 @@ class TestCloseMMRound:
         # Should NOT appear in active rounds
         active = await temp_db.get_active_mm_rounds()
         assert not any(r["id"] == rid for r in active)
+        assert temp_db._db is not None
+        async with temp_db._db.execute(
+            "SELECT realized_pnl, rebate_est, net_pnl FROM mm_rounds WHERE id = ?",
+            (rid,),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["realized_pnl"] == 2.0
+        assert row["rebate_est"] == 0.30
+        assert row["net_pnl"] == 2.30
 
     @pytest.mark.asyncio
     async def test_close_with_loss(self, temp_db: Database):
@@ -177,8 +185,6 @@ class TestGetConsecutiveLosses:
         Uses a deliberate 1s delay between the win and loss to ensure
         closed_at timestamps differ and ORDER BY is deterministic.
         """
-        import time
-
         # Round 1: win
         r1 = await temp_db.insert_mm_round(
             market_id=_MKT, token_id=_TOK, question=_Q,
@@ -240,16 +246,16 @@ class TestGetDailyMMPnl:
 
     @pytest.mark.asyncio
     async def test_sums_today_closed(self, temp_db: Database):
-        """Multiple closed rounds today should sum their P&L."""
-        for pnl in [1.0, 2.0, -0.5]:
+        """Multiple closed rounds today should sum their net P&L."""
+        for pnl, rebate in [(1.0, 0.10), (2.0, 0.20), (-0.5, 0.05)]:
             rid = await temp_db.insert_mm_round(
                 market_id=_MKT, token_id=_TOK, question=_Q,
                 buy_price=0.60, shares=100.0,
             )
-            await temp_db.close_mm_round(rid, sell_price=0.62, realized_pnl=pnl)
+            await temp_db.close_mm_round(rid, sell_price=0.62, realized_pnl=pnl, rebate_est=rebate)
 
         daily = await temp_db.get_daily_mm_pnl()
-        assert abs(daily - 2.5) < 0.001  # 1.0 + 2.0 - 0.5
+        assert abs(daily - 2.85) < 0.001  # gross 2.5 + rebates 0.35
 
     @pytest.mark.asyncio
     async def test_excludes_open_rounds(self, temp_db: Database):
@@ -325,7 +331,7 @@ class TestGetActiveMMRounds:
     async def test_mixed_statuses(self, temp_db: Database):
         """Only active statuses should appear."""
         # One active
-        r1 = await temp_db.insert_mm_round(
+        await temp_db.insert_mm_round(
             market_id="mkt_1", token_id=_TOK, question=_Q,
             buy_price=0.60, shares=100.0,
         )

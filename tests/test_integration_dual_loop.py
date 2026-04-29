@@ -15,10 +15,7 @@ Protocol:
 """
 from __future__ import annotations
 
-import asyncio
-import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,13 +25,9 @@ from src.polymarket.models import (
     Market,
     MarketToken,
     OrderBook,
-    OrderResponse,
-    OrderStatus,
     PriceLevel,
-    Side,
 )
 from src.strategy.market_maker import MarketMaker
-
 
 # ── Test data ─────────────────────────────────────────────────────────────────
 
@@ -155,7 +148,9 @@ class TestDualLoopIntegration:
         assert len(active) == 0, "All rounds should be closed"
 
         daily_pnl = await temp_db.get_daily_mm_pnl()
-        assert daily_pnl > 0, f"Expected positive P&L, got {daily_pnl}"
+        expected_gross = (settings.spread_target / 0.55) * settings.mm_order_size_usd
+        expected_rebate = settings.mm_order_size_usd * 0.005
+        assert daily_pnl == pytest.approx(expected_gross + expected_rebate)
 
     @pytest.mark.asyncio
     async def test_mm_handles_stop_loss_and_continues(

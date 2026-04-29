@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
@@ -90,6 +89,7 @@ CREATE TABLE IF NOT EXISTS mm_rounds (
     shares          REAL    NOT NULL,
     realized_pnl    REAL,
     rebate_est      REAL    DEFAULT 0,
+    net_pnl         REAL,
     status          TEXT    NOT NULL DEFAULT 'BUY_POSTED',
     created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     closed_at       TEXT
@@ -138,6 +138,7 @@ class Database:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
+        await self._migrate_schema()
         await self._db.commit()
         log.info("Database ready at %s", self.path)
 
@@ -145,6 +146,22 @@ class Database:
         if self._db:
             await self._db.close()
             log.info("Database connection closed.")
+
+    async def _migrate_schema(self) -> None:
+        """Apply lightweight migrations for existing SQLite databases."""
+        assert self._db
+        async with self._db.execute("PRAGMA table_info(mm_rounds)") as cur:
+            columns = {row["name"] for row in await cur.fetchall()}
+        if "net_pnl" not in columns:
+            await self._db.execute("ALTER TABLE mm_rounds ADD COLUMN net_pnl REAL")
+            await self._db.execute(
+                """
+                UPDATE mm_rounds
+                SET net_pnl = COALESCE(realized_pnl, 0) + COALESCE(rebate_est, 0)
+                WHERE status = 'CLOSED'
+                  AND realized_pnl IS NOT NULL
+                """
+            )
 
     @asynccontextmanager
     async def _tx(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -298,7 +315,6 @@ class Database:
         self, market_id: str, current_price: float
     ) -> None:
         current_value = None
-        cost = None
         async with self._tx() as db:
             async with db.execute(
                 "SELECT shares, cost_usd FROM positions WHERE market_id = ?",
@@ -444,16 +460,17 @@ class Database:
         realized_pnl: float,
         rebate_est: float = 0.0,
     ) -> None:
+        net_pnl = realized_pnl + rebate_est
         async with self._tx() as db:
             await db.execute(
                 """
                 UPDATE mm_rounds
                 SET status='CLOSED', sell_price=?, realized_pnl=?,
-                    rebate_est=?,
+                    rebate_est=?, net_pnl=?,
                     closed_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE id=?
                 """,
-                (sell_price, realized_pnl, rebate_est, round_id),
+                (sell_price, realized_pnl, rebate_est, net_pnl, round_id),
             )
 
     async def cancel_mm_round(self, round_id: int) -> None:
@@ -486,7 +503,8 @@ class Database:
         assert self._db
         async with self._db.execute(
             """
-            SELECT realized_pnl FROM mm_rounds
+            SELECT COALESCE(net_pnl, realized_pnl + COALESCE(rebate_est, 0), realized_pnl) AS pnl
+            FROM mm_rounds
             WHERE market_id = ? AND status = 'CLOSED'
             ORDER BY closed_at DESC
             LIMIT ?
@@ -497,18 +515,20 @@ class Database:
 
         streak = 0
         for row in rows:
-            if (row["realized_pnl"] or 0) < 0:
+            if (row["pnl"] or 0) < 0:
                 streak += 1
             else:
                 break
         return streak
 
     async def get_daily_mm_pnl(self) -> float:
-        """Sum of realized P&L from mm_rounds closed today."""
+        """Sum of net P&L from mm_rounds closed today."""
         assert self._db
         async with self._db.execute(
             """
-            SELECT COALESCE(SUM(realized_pnl), 0) AS pnl
+            SELECT COALESCE(SUM(
+                COALESCE(net_pnl, realized_pnl + COALESCE(rebate_est, 0), realized_pnl)
+            ), 0) AS pnl
             FROM mm_rounds
             WHERE status = 'CLOSED'
               AND closed_at >= date('now')

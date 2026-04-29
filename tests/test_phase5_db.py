@@ -9,9 +9,8 @@ from __future__ import annotations
 import asyncio
 from random import choice, random
 
-import pytest
-
 import aiosqlite
+import pytest
 
 from src.core.database import Database
 
@@ -38,8 +37,18 @@ class TestDatabaseLifecycle:
                 rows = await cur.fetchall()
                 tables = {row[0] for row in rows}
 
-        expected = {"orders", "positions", "evaluations", "ingest_log", "mm_rounds"}
+        expected = {"orders", "positions", "evaluations", "ingest_log", "mm_rounds", "mm_fills"}
         assert expected.issubset(tables), f"Missing tables: {expected - tables}"
+
+    @pytest.mark.asyncio
+    async def test_mm_rounds_has_net_pnl_column(self, temp_db: Database):
+        """Schema should persist net P&L separately from gross P&L and rebates."""
+        async with aiosqlite.connect(temp_db.path) as conn:
+            async with conn.execute("PRAGMA table_info(mm_rounds)") as cur:
+                rows = await cur.fetchall()
+                columns = {row[1] for row in rows}
+
+        assert "net_pnl" in columns
 
 
 class TestEvaluations:
