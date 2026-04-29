@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import platform
 import signal
 import socket
 import sys
@@ -242,14 +243,17 @@ def _check_dns() -> bool:
             socket.getaddrinfo(host, 443)
         except socket.gaierror:
             ok = False
-            log.error(
-                "DNS no puede resolver '%s'.\n"
-                "  Solución: cambia el DNS de tu Mac a 8.8.8.8 (Google):\n"
-                "  Configuración del Sistema → Red → <conexión activa> → Detalles → DNS\n"
-                "  Agrega 8.8.8.8 y 1.1.1.1, aplica, y ejecuta en Terminal:\n"
-                "    sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder",
-                host,
-            )
+            if platform.system() == "Darwin":
+                hint = (
+                    "Cambia el DNS a 8.8.8.8 / 1.1.1.1 y ejecuta:\n"
+                    "    sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
+                )
+            else:
+                hint = (
+                    "Verifica resolv.conf, DNS del contenedor/host, firewall o salida HTTPS; "
+                    "prueba temporalmente con DNS 8.8.8.8 / 1.1.1.1."
+                )
+            log.error("DNS no puede resolver '%s'.\n  Solución: %s", host, hint)
     return ok
 
 
@@ -342,10 +346,11 @@ async def main() -> None:
 
         provider = _NoProvider()  # type: ignore[assignment]
 
-    loops = [
-        _slow_loop(evaluator, maker, provider, cfg),
-        _run_health_server(cfg.health_port),
-    ]
+    loops = [_run_health_server(cfg.health_port)]
+    if not cfg.short_term_only_mode:
+        loops.append(_slow_loop(evaluator, maker, provider, cfg))
+    else:
+        log.info("Short-term only mode enabled — standard LLM/RAG cycle disabled.")
     if cfg.mm_enabled:
         loops.append(_fast_loop(maker, db, cfg))
         log.info(
@@ -354,8 +359,7 @@ async def main() -> None:
         )
     else:
         log.info(
-            "Starting LLM loop only (every %ds) — MM disabled (set MM_ENABLED=true to activate)",
-            cfg.cycle_interval_seconds,
+            "MM disabled (set MM_ENABLED=true to activate)",
         )
 
     if cfg.enable_short_term_markets:
@@ -377,6 +381,7 @@ async def main() -> None:
         log.info("Shutting down…")
         await notifier.send_message("🛑 <b>Polymarket Bot Apagado</b>")
         await maker.cancel_all()
+        await evaluator.close()
         await clob.close()
         await db.close()
         if hasattr(provider, "close"):

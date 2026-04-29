@@ -137,6 +137,21 @@ class ShortTermMarketContext:
         footer = "(Data from Binance public API, updated every 15 s)"
         return "\n".join([header] + parts + [footer])
 
+    async def get_context(self, market_question: str) -> str:
+        """Backward-compatible alias used by the short-term evaluator."""
+        return await self.get_context_for_market(market_question)
+
+    async def get_signals_for_market(self, market_question: str) -> list[CryptoSignal]:
+        """Return raw signals for mathematical short-term decisioning."""
+        symbols = self._extract_symbols(market_question)
+        if not symbols:
+            return []
+        results = await asyncio.gather(
+            *[self.get_signal(s) for s in symbols],
+            return_exceptions=True,
+        )
+        return [sig for sig in results if isinstance(sig, CryptoSignal)]
+
     async def close(self) -> None:
         await self._http.aclose()
 

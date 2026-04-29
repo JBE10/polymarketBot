@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from src.polymarket.models import OrderBook, Side
+from src.polymarket.models import OrderBook
 
 log = logging.getLogger(__name__)
 
@@ -115,8 +115,8 @@ class MicrostructureAnalyzer:
         Range: -1.0 (all sell pressure) to +1.0 (all buy pressure).
         Values near 0 indicate balanced flow (good for MM).
         """
-        bid_vol = sum(l.size for l in book.bids[:levels])
-        ask_vol = sum(l.size for l in book.asks[:levels])
+        bid_vol = sum(level.size for level in book.bids[:levels])
+        ask_vol = sum(level.size for level in book.asks[:levels])
         total = bid_vol + ask_vol
 
         if total < 1e-9:

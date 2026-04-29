@@ -135,7 +135,6 @@ class MarketMaker:
 
     async def _tick_slot(self, slot: _MarketSlot) -> dict[str, int]:
         result: dict[str, int] = {}
-        market = slot.market
 
         if slot.state == "IDLE":
             result = await self._handle_idle(slot)

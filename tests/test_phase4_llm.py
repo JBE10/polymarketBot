@@ -7,18 +7,17 @@ Tests the full pipeline: prompt building → LLM call → JSON parsing → Pydan
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
-from src.ai.prompts import (
-    SYSTEM_PROMPT,
-    build_evaluation_prompt,
-    build_rag_query,
-)
-from src.polymarket.models import Confidence, MarketEvaluation
+from src.ai.market_context import CryptoSignal
+from src.ai.prompts import SYSTEM_PROMPT, build_evaluation_prompt, build_rag_query
+from src.core.config import Settings
+from src.core.database import Database
+from src.polymarket.models import Confidence, Market, MarketEvaluation, MarketToken
 from src.strategy.llm_evaluator import LLMEvaluator
-
 
 # ── Canned LLM responses ─────────────────────────────────────────────────────
 
@@ -182,3 +181,83 @@ class TestParseEvaluation:
         evaluation = LLMEvaluator._parse_evaluation(args)
         assert evaluation.should_skip is False
         assert evaluation.skip_reason == ""
+
+
+class TestShortTermDecision:
+    """Short-term pipeline chooses YES or NO and persists simulation metadata."""
+
+    @pytest.mark.asyncio
+    async def test_short_term_can_buy_no_in_dry_run(
+        self, settings: Settings, temp_db: Database
+    ):
+        settings.short_term_use_monte_carlo = True
+        settings.short_term_mc_seed = 7
+        settings.short_term_mc_samples = 5_000
+        settings.short_term_min_ev_threshold = 0.03
+        settings.min_confidence = "LOW"
+        settings.short_term_math_signal_weight = 0.16
+
+        evaluator = LLMEvaluator(
+            clob=AsyncMock(),
+            rag=AsyncMock(),
+            db=temp_db,
+            settings=settings,
+        )
+        evaluator._short_term_ctx.get_signal = AsyncMock(  # type: ignore[method-assign]
+            return_value=CryptoSignal(
+                symbol="BTC",
+                price=100_000,
+                change_1m_pct=-0.40,
+                change_5m_pct=-0.80,
+                change_15m_pct=-1.20,
+                obi=-0.50,
+                volatility_pct=0.20,
+                regime="bearish",
+            )
+        )
+
+        market = Market(
+            condition_id="0x" + "9" * 64,
+            question_id="qid_short_no",
+            question="Will Bitcoin go up in the next 15 minutes?",
+            description="Short BTC pool.",
+            tokens=[
+                MarketToken(token_id="yes_short", outcome="Yes", price=0.52),
+                MarketToken(token_id="no_short", outcome="No", price=0.47),
+            ],
+            volume=10_000,
+            volume_24hr=5_000,
+            liquidity=2_000,
+            end_date_iso=(datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+        )
+
+        result = await evaluator._run_short_term_math_and_act(
+            market=market,
+            yes_price=0.52,
+            bankroll=1_000,
+            minutes_to_end=15,
+        )
+
+        assert result["action"].value == "BUY"
+        assert result["chosen_side"] == "NO"
+
+        await evaluator._act(market, result, bankroll=1_000)
+        positions = await temp_db.get_open_positions()
+        assert positions[0]["outcome"] == "NO"
+        assert positions[0]["token_id"] == "no_short"
+
+        assert temp_db._db is not None
+        async with temp_db._db.execute(
+            "SELECT chosen_side, side_price, no_price, mc_samples, mc_mean_edge "
+            "FROM evaluations WHERE market_id=?",
+            (market.condition_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["chosen_side"] == "NO"
+        assert row["side_price"] == pytest.approx(0.47)
+        assert row["no_price"] == pytest.approx(0.47)
+        assert row["mc_samples"] == 5_000
+        assert row["mc_mean_edge"] > 0
+
+        await evaluator._http_client.aclose()
+        await evaluator._short_term_ctx.close()

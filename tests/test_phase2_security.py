@@ -13,7 +13,6 @@ import pytest
 
 from src.core.security import get_private_key, get_private_key_optional
 
-
 # A valid-looking test private key (64 hex chars with 0x prefix)
 _FAKE_KEY = "0x" + "ab" * 32   # 0xabababab...  (64 hex chars)
 _BARE_KEY = "ab" * 32          # without 0x prefix

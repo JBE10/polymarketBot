@@ -131,6 +131,47 @@ class Settings(BaseSettings):
     short_term_cycle_seconds: int = Field(
         30, gt=0, description="Evaluation cycle interval for short-term markets (should be << pool duration)"
     )
+    short_term_min_ev_threshold: float | None = Field(
+        None,
+        ge=0.0,
+        description="Optional EV threshold for short-term pools; falls back to min_ev_threshold when unset",
+    )
+    short_term_use_monte_carlo: bool = Field(
+        True,
+        description="Use bounded Monte Carlo validation for short-term YES/NO side selection",
+    )
+    short_term_mc_samples: int = Field(
+        2_000,
+        ge=100,
+        le=50_000,
+        description="Monte Carlo samples per short-term decision",
+    )
+    short_term_mc_seed: int | None = Field(
+        None,
+        description="Optional seed for reproducible short-term Monte Carlo decisions",
+    )
+    short_term_mc_ev_tolerance: float = Field(
+        0.01,
+        ge=0.0,
+        le=0.10,
+        description="Allowed MC mean EV shortfall vs analytical EV before skipping",
+    )
+    short_term_math_base_prob: float = Field(
+        0.50,
+        ge=0.40,
+        le=0.60,
+        description="Neutral prior used by the mathematical short-term estimator",
+    )
+    short_term_math_signal_weight: float = Field(
+        0.08,
+        ge=0.0,
+        le=0.25,
+        description="Max probability adjustment from momentum/order-book signals",
+    )
+    short_term_only_mode: bool = Field(
+        True,
+        description="Skip slower LLM/RAG market scans and run only short-term math strategy",
+    )
 
     # ── Market-making (spread capture) ────────────────────────────────────────
     mm_enabled: bool = Field(False, description="Enable market-making fast loop (default OFF — directional-only is safer)")

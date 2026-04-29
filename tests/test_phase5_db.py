@@ -9,9 +9,8 @@ from __future__ import annotations
 import asyncio
 from random import choice, random
 
-import pytest
-
 import aiosqlite
+import pytest
 
 from src.core.database import Database
 
@@ -38,8 +37,36 @@ class TestDatabaseLifecycle:
                 rows = await cur.fetchall()
                 tables = {row[0] for row in rows}
 
-        expected = {"orders", "positions", "evaluations", "ingest_log", "mm_rounds"}
+        expected = {"orders", "positions", "evaluations", "ingest_log", "mm_rounds", "mm_fills"}
         assert expected.issubset(tables), f"Missing tables: {expected - tables}"
+
+    @pytest.mark.asyncio
+    async def test_mm_rounds_has_net_pnl_column(self, temp_db: Database):
+        """Schema should persist net P&L separately from gross P&L and rebates."""
+        async with aiosqlite.connect(temp_db.path) as conn:
+            async with conn.execute("PRAGMA table_info(mm_rounds)") as cur:
+                rows = await cur.fetchall()
+                columns = {row[1] for row in rows}
+
+        assert "net_pnl" in columns
+
+    @pytest.mark.asyncio
+    async def test_evaluations_has_short_term_decision_columns(self, temp_db: Database):
+        """Schema should persist side selection and Monte Carlo diagnostics."""
+        async with aiosqlite.connect(temp_db.path) as conn:
+            async with conn.execute("PRAGMA table_info(evaluations)") as cur:
+                rows = await cur.fetchall()
+                columns = {row[1] for row in rows}
+
+        assert {
+            "chosen_side",
+            "side_price",
+            "no_price",
+            "mc_samples",
+            "mc_mean_edge",
+            "mc_p05_edge",
+            "mc_p95_edge",
+        }.issubset(columns)
 
 
 class TestEvaluations:
@@ -80,6 +107,47 @@ class TestEvaluations:
         )
         assert await temp_db.was_recently_evaluated("mkt_002", within_hours=1)
         assert not await temp_db.was_recently_evaluated("mkt_nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_insert_short_term_decision_metadata(self, temp_db: Database):
+        row_id = await temp_db.insert_evaluation(
+            market_id="mkt_short",
+            question="Will BTC go up in 15 minutes?",
+            market_price=0.62,
+            estimated_prob=0.40,
+            expected_value=0.02,
+            kelly_fraction=0.01,
+            position_size_usd=10.0,
+            confidence="HIGH",
+            reasoning="NO has the better edge.",
+            key_factors="[]",
+            action="BUY",
+            chosen_side="NO",
+            side_price=0.38,
+            no_price=0.38,
+            mc_samples=2_000,
+            mc_mean_edge=0.021,
+            mc_p05_edge=-0.38,
+            mc_p95_edge=0.62,
+        )
+
+        assert row_id > 0
+        assert temp_db._db is not None
+        async with temp_db._db.execute(
+            """
+            SELECT chosen_side, side_price, no_price, mc_samples, mc_mean_edge
+            FROM evaluations
+            WHERE id = ?
+            """,
+            (row_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["chosen_side"] == "NO"
+        assert row["side_price"] == 0.38
+        assert row["no_price"] == 0.38
+        assert row["mc_samples"] == 2_000
+        assert row["mc_mean_edge"] == 0.021
 
 
 class TestOrders:
