@@ -250,6 +250,16 @@ class Settings(BaseSettings):
             raise ValueError(f"min_confidence must be one of {allowed}")
         return v
 
+    @field_validator("short_term_mc_seed", mode="before")
+    @classmethod
+    def _coerce_empty_short_term_mc_seed(cls, v):
+        """Allow SHORT_TERM_MC_SEED='' in .env by treating it as unset."""
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     @model_validator(mode="after")
     def _ensure_data_dir(self) -> "Settings":
         self.data_dir.mkdir(parents=True, exist_ok=True)
