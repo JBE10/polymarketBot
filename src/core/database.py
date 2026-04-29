@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS evaluations (
     expected_value       REAL    NOT NULL,
     kelly_fraction       REAL    NOT NULL,
     position_size_usd    REAL    NOT NULL,
+    chosen_side          TEXT,
+    side_price           REAL,
+    no_price             REAL,
+    mc_samples           INTEGER,
+    mc_mean_edge         REAL,
+    mc_p05_edge          REAL,
+    mc_p95_edge          REAL,
     confidence           TEXT    NOT NULL,       -- LOW | MEDIUM | HIGH
     reasoning            TEXT,
     key_factors          TEXT,                   -- JSON array
@@ -162,6 +169,23 @@ class Database:
                   AND realized_pnl IS NOT NULL
                 """
             )
+
+        async with self._db.execute("PRAGMA table_info(evaluations)") as cur:
+            eval_columns = {row["name"] for row in await cur.fetchall()}
+        eval_migrations = {
+            "chosen_side": "TEXT",
+            "side_price": "REAL",
+            "no_price": "REAL",
+            "mc_samples": "INTEGER",
+            "mc_mean_edge": "REAL",
+            "mc_p05_edge": "REAL",
+            "mc_p95_edge": "REAL",
+        }
+        for column, col_type in eval_migrations.items():
+            if column not in eval_columns:
+                await self._db.execute(
+                    f"ALTER TABLE evaluations ADD COLUMN {column} {col_type}"
+                )
 
     @asynccontextmanager
     async def _tx(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -350,20 +374,31 @@ class Database:
         key_factors: str,   # JSON-serialised list
         action: str,
         skip_reason: str = "",
+        chosen_side: str | None = None,
+        side_price: float | None = None,
+        no_price: float | None = None,
+        mc_samples: int | None = None,
+        mc_mean_edge: float | None = None,
+        mc_p05_edge: float | None = None,
+        mc_p95_edge: float | None = None,
     ) -> int:
         async with self._tx() as db:
             cur = await db.execute(
                 """
                 INSERT INTO evaluations
                     (market_id, question, market_price, estimated_prob, expected_value,
-                     kelly_fraction, position_size_usd, confidence, reasoning,
-                     key_factors, action, skip_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     kelly_fraction, position_size_usd, chosen_side, side_price,
+                     no_price, mc_samples, mc_mean_edge, mc_p05_edge, mc_p95_edge,
+                     confidence, reasoning, key_factors, action, skip_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     market_id, question, market_price, estimated_prob, expected_value,
-                    kelly_fraction, position_size_usd, confidence.upper(), reasoning,
-                    key_factors, action.upper(), skip_reason,
+                    kelly_fraction, position_size_usd,
+                    chosen_side.upper() if chosen_side else None,
+                    side_price, no_price, mc_samples, mc_mean_edge, mc_p05_edge,
+                    mc_p95_edge, confidence.upper(), reasoning, key_factors,
+                    action.upper(), skip_reason,
                 ),
             )
         return cur.lastrowid  # type: ignore[return-value]

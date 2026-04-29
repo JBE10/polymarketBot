@@ -137,6 +137,10 @@ class ShortTermMarketContext:
         footer = "(Data from Binance public API, updated every 15 s)"
         return "\n".join([header] + parts + [footer])
 
+    async def get_context(self, market_question: str) -> str:
+        """Backward-compatible alias used by the short-term evaluator."""
+        return await self.get_context_for_market(market_question)
+
     async def close(self) -> None:
         await self._http.aclose()
 

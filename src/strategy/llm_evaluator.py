@@ -51,6 +51,7 @@ from src.polymarket.models import (
     Side,
 )
 from src.strategy.kelly import compute_kelly
+from src.strategy.side_selection import SideChoice, choose_binary_side
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +154,11 @@ class LLMEvaluator:
     def get_approved_markets(self) -> dict[str, Market]:
         """Markets approved by the LLM for trading (updated each cycle)."""
         return dict(self._approved_markets)
+
+    async def close(self) -> None:
+        """Close owned async HTTP clients."""
+        await self._http_client.aclose()
+        await self._short_term_ctx.close()
 
     async def run_cycle(self, bankroll: float) -> dict[str, int]:
         """
@@ -259,7 +265,14 @@ class LLMEvaluator:
 
     async def _filter_candidates(self, markets: list[Market]) -> list[Market]:
         """Apply fast, cheap filters before the expensive LLM call (standard markets)."""
-        open_positions = {p["market_id"] for p in await self._db.get_open_positions()}
+        positions = await self._db.get_open_positions()
+        if len(positions) >= self._cfg.max_open_positions:
+            log.info(
+                "SKIP standard scan: max_open_positions reached (%d/%d)",
+                len(positions), self._cfg.max_open_positions,
+            )
+            return []
+        open_positions = {p["market_id"] for p in positions}
         candidates = []
         for m in markets:
             if m.condition_id in open_positions:
@@ -290,7 +303,14 @@ class LLMEvaluator:
         # Minimum time before expiry to act (2 minutes)
         min_days = 2.0 / 60.0 / 24.0
 
-        open_positions = {p["market_id"] for p in await self._db.get_open_positions()}
+        positions = await self._db.get_open_positions()
+        if len(positions) >= cfg.max_open_positions:
+            log.info(
+                "[ST] SKIP scan: max_open_positions reached (%d/%d)",
+                len(positions), cfg.max_open_positions,
+            )
+            return []
+        open_positions = {p["market_id"] for p in positions}
         candidates = []
         for m in markets:
             if m.condition_id in open_positions:
@@ -305,7 +325,12 @@ class LLMEvaluator:
             days = m.days_to_end
             if days is None or days > max_days or days < min_days:
                 continue
-            if m.yes_price is None or not (0.05 < m.yes_price < 0.95):
+            if (
+                m.yes_price is None
+                or m.no_price is None
+                or not (0.05 < m.yes_price < 0.95)
+                or not (0.05 < m.no_price < 0.95)
+            ):
                 continue
             # Only act on crypto-related questions
             if not self._is_crypto_market(m):
@@ -384,7 +409,7 @@ class LLMEvaluator:
         minutes   = days * 24.0 * 60.0 if days is not None else None
 
         # ── Real-time microstructure context ───────────────────────────────
-        crypto_context = await self._short_term_ctx.get_context(market.question)
+        crypto_context = await self._short_term_ctx.get_context_for_market(market.question)
         if crypto_context:
             log.info(
                 "[ST] Microstructure context (%d chars) for '%s'",
@@ -404,8 +429,10 @@ class LLMEvaluator:
             liquidity=market.liquidity,
         )
 
-        return await self._run_llm_and_act(market, user_msg, yes_price, bankroll,
-                                           system_prompt=SHORT_TERM_SYSTEM_PROMPT)
+        return await self._run_short_term_llm_and_act(
+            market, user_msg, yes_price, bankroll,
+            system_prompt=SHORT_TERM_SYSTEM_PROMPT,
+        )
 
     # ── Shared LLM dispatch + decision + DB persist ───────────────────────────
 
@@ -481,7 +508,116 @@ class LLMEvaluator:
             "kelly":      kelly,
             "market":     market,
             "yes_price":  yes_price,
+            "chosen_side": "YES",
         }
+
+    async def _run_short_term_llm_and_act(
+        self,
+        market: Market,
+        user_msg: str,
+        yes_price: float,
+        bankroll: float,
+        system_prompt: str,
+    ) -> dict:
+        """Short-term decision path: evaluate both YES and NO before acting."""
+        evaluation = await self._call_strategy_provider(user_msg, system_prompt)
+        if evaluation is None:
+            return {"action": Action.SKIP, "skip_reason": "LLM call failed"}
+
+        no_price = market.no_price
+        if no_price is None:
+            return {"action": Action.SKIP, "skip_reason": "NO price unavailable"}
+
+        min_ev = self._cfg.short_term_min_ev_threshold or self._cfg.min_ev_threshold
+        choice = choose_binary_side(
+            yes_probability=evaluation.probability_estimate,
+            yes_price=yes_price,
+            no_price=no_price,
+            bankroll=bankroll,
+            kelly_fraction=self._cfg.kelly_fraction,
+            max_position_usd=self._cfg.max_position_usd,
+            min_ev_threshold=min_ev,
+            use_monte_carlo=self._cfg.short_term_use_monte_carlo,
+            mc_samples=self._cfg.short_term_mc_samples,
+            mc_seed=self._cfg.short_term_mc_seed,
+            mc_ev_tolerance=self._cfg.short_term_mc_ev_tolerance,
+        )
+
+        action = self._decide_short_term(evaluation, choice, min_ev)
+        selected_kelly = choice.kelly if choice else compute_kelly(
+            prob=evaluation.probability_estimate,
+            entry_price=yes_price,
+            bankroll=bankroll,
+            kelly_fraction=self._cfg.kelly_fraction,
+            max_position_usd=self._cfg.max_position_usd,
+        )
+        mc = choice.mc if choice else None
+
+        await self._db.insert_evaluation(
+            market_id=market.condition_id,
+            question=market.question,
+            market_price=yes_price,
+            estimated_prob=evaluation.probability_estimate,
+            expected_value=selected_kelly.ev_per_dollar,
+            kelly_fraction=selected_kelly.frac_kelly,
+            position_size_usd=selected_kelly.position_usd,
+            confidence=evaluation.confidence.value,
+            reasoning=evaluation.reasoning,
+            key_factors=json.dumps(evaluation.key_factors),
+            action=action.value,
+            skip_reason=evaluation.skip_reason if action == Action.BUY else (
+                evaluation.skip_reason or "No YES/NO side cleared short-term EV/Kelly gates"
+            ),
+            chosen_side=choice.outcome.value if choice else None,
+            side_price=choice.price if choice else None,
+            no_price=no_price,
+            mc_samples=mc.samples if mc else None,
+            mc_mean_edge=mc.mean_edge if mc else None,
+            mc_p05_edge=mc.p05_edge if mc else None,
+            mc_p95_edge=mc.p95_edge if mc else None,
+        )
+
+        await self._db.upsert_calibration(
+            market_id=market.condition_id,
+            question=market.question,
+            predicted_prob=evaluation.probability_estimate,
+            market_price=yes_price,
+            llm_provider=self._provider,
+        )
+
+        side = choice.outcome.value if choice else "NONE"
+        log.info(
+            "[ST] Evaluated: %-50s YES=%.3f NO=%.3f pYES=%.3f side=%s EV=%+.3f action=%s",
+            market.question[:50],
+            yes_price,
+            no_price,
+            evaluation.probability_estimate,
+            side,
+            selected_kelly.ev_per_dollar,
+            action.value,
+        )
+
+        return {
+            "action": action,
+            "evaluation": evaluation,
+            "kelly": selected_kelly,
+            "market": market,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "choice": choice,
+            "chosen_side": side,
+        }
+
+    async def _call_strategy_provider(
+        self, user_msg: str, system_prompt: str
+    ) -> Optional[MarketEvaluation]:
+        if self._provider == "claude":
+            return await self._call_claude(user_msg, system_prompt)
+        if self._provider == "lmstudio":
+            return await self._call_lmstudio(user_msg, system_prompt)
+        if self._provider == "ollama":
+            return await self._call_ollama(user_msg, system_prompt)
+        return await self._call_gemini(user_msg, system_prompt)
 
     # ── Ollama (local) ────────────────────────────────────────────────────────
 
@@ -791,16 +927,36 @@ class LLMEvaluator:
 
         return Action.BUY
 
+    def _decide_short_term(
+        self,
+        ev: MarketEvaluation,
+        choice: SideChoice | None,
+        min_ev_threshold: float,
+    ) -> Action:
+        """Apply short-term gates after YES/NO side selection."""
+        if choice is None:
+            return Action.SKIP
+        if choice.kelly.ev_per_dollar < min_ev_threshold:
+            return Action.SKIP
+        meets = self._cfg.meets_confidence(ev.confidence.value)
+        if not meets:
+            return Action.SKIP
+        if ev.should_skip and choice.kelly.ev_per_dollar < min_ev_threshold * 2:
+            return Action.SKIP
+        return Action.BUY
+
     # ── Order execution ───────────────────────────────────────────────────────
 
     async def _act(self, market: Market, result: dict, bankroll: float) -> None:
         """Place an order (or simulate in dry-run) and update the database."""
-        kelly     = result["kelly"]
-        yes_price = result["yes_price"]
-        yes_token = market.yes_token
+        kelly = result["kelly"]
+        choice = result.get("choice")
+        outcome = choice.outcome.value if choice else result.get("chosen_side", "YES")
+        price = choice.price if choice else result["yes_price"]
+        token = market.yes_token if outcome == "YES" else market.no_token
 
-        if yes_token is None:
-            log.warning("No YES token for %s — skipping.", market.condition_id)
+        if token is None:
+            log.warning("No %s token for %s — skipping.", outcome, market.condition_id)
             return
 
         shares   = kelly.shares
@@ -808,43 +964,43 @@ class LLMEvaluator:
 
         if self._cfg.dry_run:
             log.info(
-                "[DRY-RUN] Would BUY %.2f YES shares of '%s' at %.3f ($%.2f)",
-                shares, market.question[:50], yes_price, cost_usd,
+                "[DRY-RUN] Would BUY %.2f %s shares of '%s' at %.3f ($%.2f)",
+                shares, outcome, market.question[:50], price, cost_usd,
             )
             await self._db.insert_order(
                 market_id=market.condition_id,
-                token_id=yes_token.token_id,
+                token_id=token.token_id,
                 question=market.question,
                 side="BUY",
-                price=yes_price,
+                price=price,
                 size=shares,
                 status="DRY_RUN",
             )
             await self._db.upsert_position(
                 market_id=market.condition_id,
-                token_id=yes_token.token_id,
+                token_id=token.token_id,
                 question=market.question,
-                outcome="YES",
-                avg_entry_price=yes_price,
+                outcome=outcome,
+                avg_entry_price=price,
                 shares=shares,
                 cost_usd=cost_usd,
-                current_price=yes_price,
+                current_price=price,
             )
             return
 
         order_req = OrderRequest(
-            token_id=yes_token.token_id,
-            price=round(yes_price, 2),
+            token_id=token.token_id,
+            price=round(price, 2),
             size=round(shares, 2),
             side=Side.BUY,
         )
 
         order_db_id = await self._db.insert_order(
             market_id=market.condition_id,
-            token_id=yes_token.token_id,
+            token_id=token.token_id,
             question=market.question,
             side="BUY",
-            price=yes_price,
+            price=price,
             size=shares,
         )
 
@@ -858,20 +1014,22 @@ class LLMEvaluator:
         )
 
         if resp.success:
+            filled_price = resp.filled_price or price
+            filled_size = resp.filled_size or shares
             await self._db.upsert_position(
                 market_id=market.condition_id,
-                token_id=yes_token.token_id,
+                token_id=token.token_id,
                 question=market.question,
-                outcome="YES",
-                avg_entry_price=yes_price,
-                shares=resp.filled_size or shares,
-                cost_usd=cost_usd,
-                current_price=yes_price,
+                outcome=outcome,
+                avg_entry_price=filled_price,
+                shares=filled_size,
+                cost_usd=filled_size * filled_price,
+                current_price=filled_price,
             )
             log.info(
-                "Order FILLED: %.2f YES shares of '%s' @ %.3f (txh=%s)",
-                resp.filled_size, market.question[:45],
-                yes_price, (resp.transaction_hash or "N/A")[:12],
+                "Order FILLED: %.2f %s shares of '%s' @ %.3f (txh=%s)",
+                filled_size, outcome, market.question[:45],
+                filled_price, (resp.transaction_hash or "N/A")[:12],
             )
         else:
             log.warning(

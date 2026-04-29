@@ -48,6 +48,7 @@ class PolyProvider:
         reachable endpoint.  Raises RuntimeError if none connect.
         """
         for url in rpc_urls:
+            w3: AsyncWeb3 | None = None
             try:
                 w3 = AsyncWeb3(AsyncHTTPProvider(url))
                 if await w3.is_connected():
@@ -57,6 +58,9 @@ class PolyProvider:
                     return inst
             except Exception as exc:
                 log.warning("RPC %s unreachable: %s", url, exc)
+            finally:
+                if w3 is not None:
+                    await w3.provider.disconnect()
 
         raise RuntimeError(
             f"No reachable Polygon RPC endpoint among: {rpc_urls}"

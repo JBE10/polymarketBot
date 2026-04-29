@@ -168,6 +168,8 @@ with tab1:
             buys["simulated_pnl"] = buys["position_size_usd"] * buys["expected_value"]
             buys["cumulative_pnl"] = buys["simulated_pnl"].cumsum()
             buys["cumulative_capital"] = buys["position_size_usd"].cumsum()
+            if "chosen_side" not in buys.columns:
+                buys["chosen_side"] = "YES"
 
             # KPIs
             total_pnl      = buys["simulated_pnl"].sum()
@@ -180,7 +182,9 @@ with tab1:
                        delta=f"{'▲' if total_pnl >= 0 else '▼'}")
             c2.metric("Capital Deployed", f"${total_capital:,.2f}")
             c3.metric("Avg Expected Value", f"{avg_ev:+.4f}")
-            c4.metric("BUY Evaluations", f"{trade_count:,}")
+            side_counts = buys["chosen_side"].fillna("YES").value_counts()
+            side_mix = " / ".join(f"{side}: {count}" for side, count in side_counts.items())
+            c4.metric("BUY Evaluations", f"{trade_count:,}", delta=side_mix or None)
 
             # Cumulative P&L line chart
             fig = px.line(
@@ -199,24 +203,26 @@ with tab1:
                 buys.tail(50),
                 x="created_at",
                 y="simulated_pnl",
-                color="confidence",
+                color="chosen_side",
                 title="Per-Trade Simulated P&L (last 50 BUYs)",
                 labels={"simulated_pnl": "P&L ($)", "created_at": "Time"},
-                color_discrete_map={
-                    "HIGH": "#2ecc71", "MEDIUM": "#f39c12", "LOW": "#e74c3c"
-                },
+                color_discrete_map={"YES": "#2ecc71", "NO": "#e67e22"},
+                hover_data=["confidence"],
             )
             fig2.update_layout(height=350)
             st.plotly_chart(fig2, use_container_width=True)
 
             # Raw data expander
             with st.expander("Raw BUY evaluations"):
+                display_cols = [
+                    "chosen_side", "side_price", "mc_mean_edge",
+                    "created_at", "question", "market_price",
+                    "estimated_prob", "expected_value", "kelly_fraction",
+                    "position_size_usd", "confidence", "simulated_pnl",
+                ]
+                display_cols = [c for c in display_cols if c in buys.columns]
                 st.dataframe(
-                    buys[[
-                        "created_at", "question", "market_price",
-                        "estimated_prob", "expected_value", "kelly_fraction",
-                        "position_size_usd", "confidence", "simulated_pnl",
-                    ]].tail(100),
+                    buys[display_cols].tail(100),
                     use_container_width=True,
                 )
 
