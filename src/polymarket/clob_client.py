@@ -44,10 +44,10 @@ import httpx
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
+    BalanceAllowanceParams,
     OpenOrderParams,
     OrderArgs,
     OrderType,
-    TradeParams,
 )
 from py_clob_client.constants import POLYGON
 
@@ -341,11 +341,12 @@ class AsyncClobClient:
         try:
             raw = await asyncio.to_thread(
                 partial(
-                    self._client.get_open_orders,
+                    self._client.get_orders,
                     params=OpenOrderParams(),
                 )
             )
-            return raw.get("data") or []
+            # get_orders() returns a list directly (not {"data": [...]})
+            return raw if isinstance(raw, list) else []
         except Exception as exc:
             log.warning("get_open_orders failed: %s", exc)
             return []
@@ -354,7 +355,9 @@ class AsyncClobClient:
         """Return USDC balance and CLOB allowance for the trading wallet."""
         assert self._client
         try:
-            raw = await asyncio.to_thread(self._client.get_balance_allowance)
+            raw = await asyncio.to_thread(
+                partial(self._client.get_balance_allowance, BalanceAllowanceParams())
+            )
             return {
                 "balance":   float(raw.get("balance",   0) or 0),
                 "allowance": float(raw.get("allowance", 0) or 0),

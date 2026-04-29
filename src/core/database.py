@@ -369,7 +369,7 @@ class Database:
         return cur.lastrowid  # type: ignore[return-value]
 
     async def was_recently_evaluated(
-        self, market_id: str, within_hours: int = 6
+        self, market_id: str, within_hours: float = 6
     ) -> bool:
         """True if this market was already evaluated in the last N hours."""
         assert self._db
