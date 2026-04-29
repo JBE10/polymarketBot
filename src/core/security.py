@@ -50,11 +50,11 @@ def get_private_key(
     """
     Extrae la clave privada provista vía variable de entorno (para VPS/Docker)
     o del Llavero de macOS en tiempo de ejecución.
-    
+
     Prioridad: config (PRIVATE_KEY) → Keychain macOS → Lanza PermissionError.
     """
     from src.core.config import get_settings
-    
+
     cfg_key = get_settings().private_key
     if cfg_key:
         clave = cfg_key.strip()

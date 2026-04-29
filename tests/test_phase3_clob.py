@@ -9,17 +9,12 @@ this version uses canned responses that exercise the same parsing logic.
 """
 from __future__ import annotations
 
-import pytest
-
+from src.polymarket.clob_client import _parse_gamma_market, _parse_order_book
 from src.polymarket.models import (
     Market,
-    MarketToken,
     OrderBook,
-    PriceLevel,
     Side,
 )
-from src.polymarket.clob_client import _parse_gamma_market, _parse_order_book
-
 
 # ── Canned API responses ─────────────────────────────────────────────────────
 
@@ -115,7 +110,7 @@ class TestParseGammaMarket:
 
     def test_invalid_data_returns_none(self):
         """Garbage dict should return None, not raise."""
-        result = _parse_gamma_market({"invalid": True})
+        _parse_gamma_market({"invalid": True})
         # May return a Market with empty fields or None — either is acceptable
         # The important thing is no exception is raised
 

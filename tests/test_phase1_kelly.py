@@ -17,7 +17,6 @@ from src.strategy.kelly import (
     multi_market_kelly,
 )
 
-
 # ── Constants for the canonical test case ─────────────────────────────────────
 
 PROB       = 0.88

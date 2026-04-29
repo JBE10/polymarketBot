@@ -17,7 +17,6 @@ Expected Value per dollar of stake:
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 

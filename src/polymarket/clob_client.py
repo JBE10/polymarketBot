@@ -35,12 +35,12 @@ Reference: https://github.com/Polymarket/py-clob-client
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 from functools import partial
 from typing import Any, Optional
 
 import httpx
-
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
@@ -365,11 +365,6 @@ class AsyncClobClient:
         except Exception as exc:
             log.warning("get_balance_allowance failed: %s", exc)
             return {"balance": 0.0, "allowance": 0.0}
-
-
-# ── Parsing helpers ────────────────────────────────────────────────────────────
-
-import json as _json
 
 
 def _parse_gamma_market(raw: dict[str, Any]) -> Optional[Market]:

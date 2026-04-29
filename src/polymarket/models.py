@@ -10,7 +10,6 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class Side(str, Enum):
@@ -149,11 +148,11 @@ class OrderBook(BaseModel):
 
     @property
     def best_bid(self) -> Optional[float]:
-        return max((l.price for l in self.bids), default=None)
+        return max((level.price for level in self.bids), default=None)
 
     @property
     def best_ask(self) -> Optional[float]:
-        return min((l.price for l in self.asks), default=None)
+        return min((level.price for level in self.asks), default=None)
 
     @property
     def mid_price(self) -> Optional[float]:
@@ -172,7 +171,7 @@ class OrderBook(BaseModel):
     def depth_usd(self, side: Side, levels: int = 5) -> float:
         """Total USD value in the top N levels on one side."""
         book = self.bids if side == Side.BUY else self.asks
-        return sum(l.price * l.size for l in book[:levels])
+        return sum(level.price * level.size for level in book[:levels])
 
 
 # ── Order ─────────────────────────────────────────────────────────────────────
